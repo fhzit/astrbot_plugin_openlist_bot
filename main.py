@@ -909,7 +909,7 @@ class OpenlistPlugin(Star):
         """
         denied = self._submit_deny_if_applicable(event)
         if denied is not None:
-            yield denied
+            yield event.plain_result(denied)
             return
         async for result in self.browse_service.search_files(event, keyword, path):
             yield result
@@ -932,9 +932,9 @@ class OpenlistPlugin(Star):
         if not site_url:
             site_url = (user_config.get("openlist_url") or "").strip()
         if not site_url:
-            yield "❓ 尚未配置云盘网站地址。\n💡 管理员可在后台插件配置中填写 openlist_url / public_openlist_url。"
+            yield event.plain_result("❓ 尚未配置云盘网站地址。\n💡 管理员可在后台插件配置中填写 openlist_url / public_openlist_url。")
             return
-        yield (
+        yield event.plain_result(
             f"☁️ 云盘网站：\n{site_url}\n\n"
             f"💡 点击上方链接即可跳转打开云盘。"
         )
@@ -971,7 +971,7 @@ class OpenlistPlugin(Star):
             user_config = {}
         # 投稿模式下：仅白名单用户可手动执行「素材 上传」；素材提交走私聊自动上传
         if self.is_submit_mode(user_config) and not self.is_whitelisted_user(user_id):
-            yield "🔒 投稿模式下，请直接私聊发送素材给机器人，系统会自动上传到你的投稿文件夹。"
+            yield event.plain_result("🔒 投稿模式下，请直接私聊发送素材给机器人，系统会自动上传到你的投稿文件夹。")
             return
         # 合并 AstrBot 解析的首个参数与指令后的完整文字，支持多词自定义说明
         target = (target or "").strip()
@@ -1030,7 +1030,7 @@ class OpenlistPlugin(Star):
         except Exception:
             user_config = {}
         if self.is_submit_mode(user_config) and not self.is_whitelisted_user(user_id):
-            yield "🔒 投稿模式下仅白名单用户可执行删除操作。"
+            yield event.plain_result("🔒 投稿模式下仅白名单用户可执行删除操作。")
             return
         async for result in self.browse_service.remove_command(event, path):
             yield result
@@ -1044,7 +1044,7 @@ class OpenlistPlugin(Star):
         """
         denied = self._submit_deny_if_applicable(event)
         if denied is not None:
-            yield denied
+            yield event.plain_result(denied)
             return
         async for result in self.browse_service.mkdir_command(event, name):
             yield result
@@ -1063,7 +1063,7 @@ class OpenlistPlugin(Star):
         user_id = event.get_sender_id()
         # 1) 仅高级白名单用户可执行
         if not self.is_advanced_whitelisted_user(user_id):
-            yield "🔒 白名单增删指令仅限【高级白名单】用户使用。\n💡 普通白名单与普通用户在投稿权限上相同，仅高级白名单可管理白名单。"
+            yield event.plain_result("🔒 白名单增删指令仅限【高级白名单】用户使用。\n💡 普通白名单与普通用户在投稿权限上相同，仅高级白名单可管理白名单。")
             return
 
         # 2) 解析动作与 QQ（兼容 “增加10001” 无空格 与 “增加 10001” 带空格）
@@ -1080,16 +1080,16 @@ class OpenlistPlugin(Star):
                 qq = tail
 
         if action in ("查看", "list", "显示"):
-            yield self._whitelist_status_text()
+            yield event.plain_result(self._whitelist_status_text())
             return
 
         if action not in ("增加", "添加", "add", "删除", "移除", "del", "remove"):
-            yield self._whitelist_usage_tip()
+            yield event.plain_result(self._whitelist_usage_tip())
             return
 
         qq = qq.strip()
         if not qq or not qq.isdigit():
-            yield self._whitelist_usage_tip()
+            yield event.plain_result(self._whitelist_usage_tip())
             return
 
         is_add = action in ("增加", "添加", "add")
@@ -1097,18 +1097,18 @@ class OpenlistPlugin(Star):
         existed = qq in normal
         if is_add:
             if existed:
-                yield f"ℹ️ QQ {qq} 已在普通白名单中，无需重复添加。"
+                yield event.plain_result(f"ℹ️ QQ {qq} 已在普通白名单中，无需重复添加。")
                 return
             normal.append(qq)
             self._set_submit_whitelist_normal(normal)
-            yield f"✅ 已将 QQ {qq} 加入普通白名单。\n📋 当前普通白名单: {self._format_q_list(normal)}"
+            yield event.plain_result(f"✅ 已将 QQ {qq} 加入普通白名单。\n📋 当前普通白名单: {self._format_q_list(normal)}")
         else:
             if not existed:
-                yield f"ℹ️ QQ {qq} 不在普通白名单中，无需删除。"
+                yield event.plain_result(f"ℹ️ QQ {qq} 不在普通白名单中，无需删除。")
                 return
             normal.remove(qq)
             self._set_submit_whitelist_normal(normal)
-            yield f"✅ 已从普通白名单移除 QQ {qq}。\n📋 当前普通白名单: {self._format_q_list(normal)}"
+            yield event.plain_result(f"✅ 已从普通白名单移除 QQ {qq}。\n📋 当前普通白名单: {self._format_q_list(normal)}")
 
     def _split_whitelist_action(self, raw: str):
         """从形如 “增加10001”/“删除10001” 中拆出动作与 QQ；否则原样返回。"""
