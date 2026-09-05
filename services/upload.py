@@ -10,7 +10,6 @@ import aiohttp
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain
-from astrbot.api.message_components import Plain
 from astrbot.api.star import StarTools
 
 from ..lib.client import OpenlistClient
@@ -215,7 +214,7 @@ class UploadService(PluginService):
         import asyncio
         origin = getattr(event, "unified_msg_origin", None) or ""
         task = asyncio.create_task(
-            self._auto_upload_private(user_id, cached_message, origin)
+            self._auto_upload_private(event, user_id, cached_message, origin)
         )
         # 保存引用防止被 GC；完成时清理
         if not hasattr(self, "_auto_upload_tasks"):
@@ -223,7 +222,28 @@ class UploadService(PluginService):
         self._auto_upload_tasks.add(task)
         task.add_done_callback(self._auto_upload_tasks.discard)
 
-    async def _auto_upload_private(self, user_id: str, cached_message: Dict, origin: str = ""):
+    async def _resolve_private_file_url(self, event: AstrMessageEvent, segment: Dict, user_id: str) -> Optional[str]:
+        """解析私聊文件下载 URL（OneBot get_private_file_url）。"""
+        data = segment.get("data") or {}
+        file_id = data.get("file_id")
+        if not file_id:
+            return None
+        bot = getattr(event, "bot", None)
+        api = getattr(bot, "api", None)
+        if api is None:
+            return None
+        try:
+            url_res = await api.call_action(
+                "get_private_file_url",
+                user_id=str(user_id),
+                file_id=str(file_id),
+            )
+            return url_res.get("url") if isinstance(url_res, dict) else None
+        except Exception as e:
+            logger.warning(f"获取私聊文件 URL 失败: file_id={file_id}, err={e}")
+            return None
+
+    async def _auto_upload_private(self, event: AstrMessageEvent, user_id: str, cached_message: Dict, origin: str = ""):
         """直接上传私聊收到的素材附件到目标目录。"""
         nav_key = f"private:user:{user_id}"
         upload_segments = self._extract_upload_segments(cached_message)
@@ -237,7 +257,7 @@ class UploadService(PluginService):
         async def notify(text: str):
             if origin:
                 try:
-                    chain = MessageChain().message(Plain(text))
+                    chain = MessageChain().message(text)
                     await self.plugin.context.send_message(origin, chain)
                     return
                 except Exception as e:
@@ -273,6 +293,19 @@ class UploadService(PluginService):
                 if target_path not in ("", "/"):
                     await client.ensure_dir(target_path)
                 for index, segment in enumerate(upload_segments, start=1):
+                    # 私聊文件附件没有自带 url，需先经 get_private_file_url 解析
+                    seg_data = segment.get("data") or {}
+                    if (
+                        segment.get("type") in ("file", "video")
+                        and not seg_data.get("url")
+                        and not self._is_http_url(seg_data.get("file", ""))
+                        and seg_data.get("file_id")
+                    ):
+                        resolved_url = await self._resolve_private_file_url(event, segment, user_id)
+                        if resolved_url:
+                            seg_data["url"] = resolved_url
+                            seg_data["file"] = resolved_url
+                            segment["data"] = seg_data
                     item = await self._build_upload_item(None, cached_message, segment)
                     original_name = item["name"]
                     file_name = original_name
