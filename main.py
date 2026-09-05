@@ -382,18 +382,51 @@ class OpenlistPlugin(Star):
             return session_key.split(":user:", 1)[1]
         return session_key
 
+    def _get_submit_whitelist(self, global_cfg: Dict) -> List[str]:
+        """解析投稿白名单 Q 号列表（来自 WebUI submit_whitelist，逗号分隔）。"""
+        raw = (global_cfg.get("submit_whitelist") or "").strip()
+        if not raw:
+            return []
+        ids = []
+        for part in raw.split(","):
+            part = part.strip()
+            if part:
+                ids.append(part)
+        return ids
+
+    def is_whitelisted_user(self, user_id) -> bool:
+        """判断某用户是否为投稿白名单用户。"""
+        uid = str(user_id).strip()
+        if not uid:
+            return False
+        try:
+            global_cfg = self.get_global_config()
+        except Exception:
+            return False
+        return uid in self._get_submit_whitelist(global_cfg)
+
+    def _submit_anchor_dir(self, submit_root: str, sender_id: str) -> str:
+        """投稿模式下用户的访问锚点目录：
+        白名单用户锚定到投稿根目录（可浏览/管理所有用户的文件夹），
+        非白名单用户锚定到自己的个人目录。"""
+        if self.is_whitelisted_user(sender_id):
+            return self._normalize_openlist_path(submit_root)
+        return self.get_user_submit_dir(submit_root, sender_id)
+
     def _clamp_to_user_submit_dir(self, resolved_path: str, submit_root: str, sender_id: str) -> str:
-        """把解析出的路径限制到投稿用户个人目录内；根目录/他人目录一律拉回个人目录。"""
-        user_dir = self.get_user_submit_dir(submit_root, sender_id)
+        """把解析出的路径限制到投稿用户的允许范围内；越权路径一律拉回。
+        白名单用户允许投稿根目录及以下，非白名单用户仅允许自己的个人目录内。"""
+        anchor = self._submit_anchor_dir(submit_root, sender_id)
         p = self._normalize_openlist_path(resolved_path)
-        ulist = user_dir.rstrip("/")
-        if p.startswith(ulist + "/") or p == ulist:
+        alist = anchor.rstrip("/")
+        if p.startswith(alist + "/") or p == alist:
             return p
-        # 回到根、越权到其他用户/根目录下 → 一律回个人目录
-        return user_dir
+        # 回到根、越权到其他用户/根目录下 → 一律回锚点目录
+        return anchor
 
     def _submit_deny_if_applicable(self, event) -> Optional[str]:
-        """投稿模式下屏蔽越权指令；未开启投稿模式返回 None。"""
+        """投稿模式下屏蔽越权指令（搜索、新建）；未开启投稿模式返回 None。
+        删除指令由 remove_command 单独按白名单判断。"""
         try:
             user_config = self.get_user_config(event.get_sender_id())
         except Exception:
@@ -401,8 +434,7 @@ class OpenlistPlugin(Star):
         if not self.is_submit_mode(user_config):
             return None
         return (
-            "🔒 投稿模式已开启：你只能使用 素材 列表 / 素材 下载 / 素材 上传 / 素材 配置 / 素材 帮助 等命令，"
-            "且仅能访问自己的投稿文件夹。删除、新建目录、搜索等命令在投稿模式下不可用。"
+            "🔒 投稿模式已开启：在投稿模式下，搜索、新建目录等指令不可用。"
         )
 
     async def _ensure_user_folder_for_event(self, event, user_config: Dict) -> str:
@@ -940,9 +972,14 @@ class OpenlistPlugin(Star):
           素材 删除 4
           素材 删除 /tmp/stale.txt
         """
-        denied = self._submit_deny_if_applicable(event)
-        if denied is not None:
-            yield denied
+        user_id = event.get_sender_id()
+        # 投稿模式下：仅白名单用户可删除
+        try:
+            user_config = self.get_user_config(user_id)
+        except Exception:
+            user_config = {}
+        if self.is_submit_mode(user_config) and not self.is_whitelisted_user(user_id):
+            yield "🔒 投稿模式下仅白名单用户可执行删除操作。"
             return
         async for result in self.browse_service.remove_command(event, path):
             yield result

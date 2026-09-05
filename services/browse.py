@@ -25,14 +25,17 @@ class BrowseService(PluginService):
                 ],
             ))
             return
-        # 投稿模式：确保个人目录存在并从个人目录开始
+        # 投稿模式：锚定到个人目录（非白名单）或投稿根目录（白名单）。白名单用户不自动建个人文件夹
         if self.is_submit_mode(user_config):
-            await self._ensure_user_folder_for_event(event, user_config)
+            anchor_dir = self._submit_anchor_dir(
+                self.get_submit_root(user_config), user_id
+            )
+            if not self.is_whitelisted_user(user_id):
+                await self._ensure_user_folder_for_event(event, user_config)
             nav_state = self._get_user_navigation_state(nav_key)
-            user_dir = self.get_user_submit_dir(self.get_submit_root(user_config), user_id)
             current = nav_state.get("current_path", "/")
-            if not (current == user_dir or current.startswith(user_dir.rstrip("/") + "/")):
-                nav_state["current_path"] = user_dir
+            if not (current == anchor_dir or current.startswith(anchor_dir.rstrip("/") + "/")):
+                nav_state["current_path"] = anchor_dir
                 nav_state["parent_paths"] = []
         path = (path or "").strip()
         target_path = self._resolve_target_path(nav_key, path)
@@ -366,17 +369,17 @@ class BrowseService(PluginService):
             ))
             return
         nav_state = self._get_user_navigation_state(nav_key)
-        # 投稿模式：禁止回退到个人投稿目录之外
+        # 投稿模式：禁止回退到允许访问范围之外
         if self.is_submit_mode(user_config):
-            user_dir = self.get_user_submit_dir(self.get_submit_root(user_config), user_id)
-            if nav_state.get("current_path") in (None, "", user_dir):
-                yield event.plain_result("🔒 你已在个人投稿文件夹根目录，无法继续回退。")
+            anchor_dir = self._submit_anchor_dir(self.get_submit_root(user_config), user_id)
+            if nav_state.get("current_path") in (None, "", anchor_dir):
+                yield event.plain_result("🔒 你已在可访问的根目录，无法继续回退。")
                 return
         if not nav_state["parent_paths"]:
             yield event.plain_result("📂 已经在根目录，无法继续回退。")
             return
         previous_path = nav_state["parent_paths"].pop()
-        # 投稿模式：回退目标也限定在个人投稿目录内（防御）
+        # 投稿模式：回退目标也限定在允许访问范围内（防御）
         if self.is_submit_mode(user_config):
             submit_root = self.get_submit_root(user_config)
             previous_path = self._clamp_to_user_submit_dir(previous_path, submit_root, user_id)

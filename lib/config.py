@@ -72,6 +72,7 @@ WEBUI_CONFIG_MAPPING = {
     "openlist_upload_response_timeout": "openlist_upload_response_timeout",
     "debug_transfer_logging": "debug_transfer_logging",
     "default_submit_path": "default_submit_path",
+    "submit_whitelist": "submit_whitelist",
     "require_user_auth": "require_user_auth",
 }
 
@@ -182,6 +183,7 @@ class GlobalConfigManager:
             "openlist_upload_response_timeout": 3000,
             "debug_transfer_logging": False,
             "default_submit_path": "",
+            "submit_whitelist": "",
         }
 
     def load_config(self) -> Dict:

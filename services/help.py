@@ -12,6 +12,7 @@ class HelpService(PluginService):
         user_config = self.get_user_config(user_id)
         global_cfg = self.get_global_config()
         is_user_auth_mode = global_cfg.get("require_user_auth", True)
+        is_whitelisted = self.is_whitelisted_user(user_id)
 
         help_text = f"""📚 OpenList 助手帮助
 💡 所有指令以「素材」开头，使用全中文命令。
@@ -58,18 +59,32 @@ class HelpService(PluginService):
 📂 `素材 新建 <名称|路径>`
    - 新建文件夹: 在当前目录或指定路径创建。
      - 示例: `素材 新建 new_folder`
-
-🗑️ `素材 删除 <路径|序号>`
+"""
+        # 仅白名单用户显示「删除」指令
+        if is_whitelisted:
+            help_text += """🗑️ `素材 删除 <路径|序号>`
    - 删除项目: 删除文件或文件夹（谨慎操作）。
      - 示例: `素材 删除 4`
      - 示例: `素材 删除 /tmp/stale_file.txt`
 
-📤 `素材 上传 [说明]` (投稿模式)
-   - 先发送图片、视频或文件，再在 5 分钟内发送本指令上传到你的个人投稿文件夹。
-   - `素材 上传 说明文字`: 上传到个人文件夹，文件自动重命名为 `{{时间戳}}_{{说明}}.{{原扩展名}}`，如 `202608291400_我的生日.jpg`。
-   - 投稿模式下只能访问自己的投稿文件夹，无法查看其他用户或退出到上级目录；搜索/删除/新建目录不可用。
-   - 上传后自动生成个人文件夹 `<投稿根路径>/<你的QQ号>`。
+"""
 
+        help_text += """📤 `素材 上传 [说明]` (投稿模式)
+   - 先发送图片、视频或文件，再在 5 分钟内发送本指令上传到你的个人投稿文件夹。
+   - `素材 上传 说明文字`: 上传到个人文件夹，文件自动重命名为 `{时间戳}_{说明}.{原扩展名}`，如 `202608291400_我的生日.jpg`。
+   - 投稿模式下只能访问自己的投稿文件夹，无法查看其他用户或退出到上级目录。
+   - 上传后自动生成个人文件夹 `<投稿根路径>/<你的QQ号>`。
+"""
+        # 上传说明按用户身份区分：白名单可查看全部用户文件夹
+        if is_whitelisted:
+            help_text = help_text.replace(
+                "   - 投稿模式下只能访问自己的投稿文件夹，无法查看其他用户或退出到上级目录。\n",
+                "   - 白名单用户可查看投稿根路径下所有用户的文件夹和内容。\n",
+            )
+
+        # 仅白名单用户显示「插件配置指令」区块 + 当前模式 + 通用提示
+        if is_whitelisted:
+            help_text += """
 ---
 插件配置指令
 ---
@@ -82,24 +97,23 @@ class HelpService(PluginService):
 ⚙️ `素材 配置 清缓存` - 清除文件列表缓存。
 """
 
-        if is_user_auth_mode:
-            help_text += f"""
+            if is_user_auth_mode:
+                help_text += """
 
 👤 当前模式: 用户独立认证
    - 每位用户都需要使用 `素材 配置 向导` 单独配置自己的 Openlist 账户信息。"""
-
-            if not self._validate_config(user_config):
-                help_text += f"""
+                if not self._validate_config(user_config):
+                    help_text += """
 
 ⚠️ 操作提示
    您尚未完成配置，请发送 `素材 配置 向导` 开始配置向导。"""
-        else:
-            help_text += f"""
+            else:
+                help_text += """
 
 🌐 当前模式: 全局共享
    - 所有用户共享管理员预设的 Openlist 服务器连接，无需单独配置。"""
 
-        help_text += f"""
+            help_text += """
 
 💡 通用提示:
 1.  路径区分大小写，以 `/` 开头表示根目录。
