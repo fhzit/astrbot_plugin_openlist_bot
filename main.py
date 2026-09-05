@@ -918,10 +918,19 @@ class OpenlistPlugin(Star):
         """上传最近附件消息。
 
         示例：
-          先发送图片、视频或文件
-          素材 上传 /movies
-          素材 上传 周日整理的资料
+         先发送图片、视频或文件
+         素材 上传 /movies
+         素材 上传 周日整理的资料
         """
+        user_id = event.get_sender_id()
+        try:
+            user_config = self.get_user_config(user_id)
+        except Exception:
+            user_config = {}
+        # 投稿模式下：仅白名单用户可手动执行「素材 上传」；素材提交走私聊自动上传
+        if self.is_submit_mode(user_config) and not self.is_whitelisted_user(user_id):
+            yield "🔒 投稿模式下，请直接私聊发送素材给机器人，系统会自动上传到你的投稿文件夹。"
+            return
         # 合并 AstrBot 解析的首个参数与指令后的完整文字，支持多词自定义说明
         target = (target or "").strip()
         raw_text = self._strip_upload_command_prefix(event)

@@ -9,7 +9,8 @@ from urllib.parse import unquote, urlparse
 import aiohttp
 
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent
+from astrbot.api.event import AstrMessageEvent, MessageChain
+from astrbot.api.message_components import Plain
 from astrbot.api.star import StarTools
 
 from ..lib.client import OpenlistClient
@@ -187,6 +188,159 @@ class UploadService(PluginService):
             f"已记录最近可上传附件消息: session={nav_key}, "
             f"segments={len(upload_segments)}, message_id={cached_message.get('message_id')}"
         )
+
+        # 私聊：收到素材附件即直接自动上传（无确认、无超时，应用后缀名过滤）
+        try:
+            group_id = self._get_event_group_id(event)
+            if group_id in (None, ""):
+                self._schedule_private_auto_upload(event, cached_message)
+        except Exception as e:
+            logger.warning(f"私聊自动上传调度失败: {e}")
+
+    def _auto_upload_enabled(self, user_config: Dict) -> bool:
+        """私聊自动上传开关：默认开启，配置 private_auto_upload 为 False 时关闭。"""
+        return bool(user_config.get("private_auto_upload", True))
+
+    def _schedule_private_auto_upload(self, event: AstrMessageEvent, cached_message: Dict):
+        """把私聊到站的素材附件放到后台任务里直接上传。"""
+        user_id = event.get_sender_id()
+        try:
+            user_config = self.get_user_config(user_id)
+        except Exception:
+            user_config = {}
+        if not self._validate_config(user_config):
+            return
+        if not self._auto_upload_enabled(user_config):
+            return
+        import asyncio
+        origin = getattr(event, "unified_msg_origin", None) or ""
+        task = asyncio.create_task(
+            self._auto_upload_private(user_id, cached_message, origin)
+        )
+        # 保存引用防止被 GC；完成时清理
+        if not hasattr(self, "_auto_upload_tasks"):
+            self._auto_upload_tasks = set()
+        self._auto_upload_tasks.add(task)
+        task.add_done_callback(self._auto_upload_tasks.discard)
+
+    async def _auto_upload_private(self, user_id: str, cached_message: Dict, origin: str = ""):
+        """直接上传私聊收到的素材附件到目标目录。"""
+        nav_key = f"private:user:{user_id}"
+        upload_segments = self._extract_upload_segments(cached_message)
+        if not upload_segments:
+            return
+
+        user_config = self.get_user_config(user_id)
+        if not self._auto_upload_enabled(user_config):
+            return
+
+        async def notify(text: str):
+            if origin:
+                try:
+                    chain = MessageChain().message(Plain(text))
+                    await self.plugin.context.send_message(origin, chain)
+                    return
+                except Exception as e:
+                    logger.warning(f"[私聊自动上传] 回执发送失败: {e}")
+            logger.info(f"[私聊自动上传] {text}")
+
+        # 目标目录：投稿模式 -> 个人投稿目录；否则 -> 根目录
+        try:
+            if self.is_submit_mode(user_config):
+                target_path = self.get_user_submit_dir(self.get_submit_root(user_config), user_id)
+            else:
+                target_path = "/"
+        except Exception:
+            target_path = "/"
+
+        # 私聊自动上传：在用户目录下追加「年月日」文件夹（如 2026_08_29），已存在则跳过
+        try:
+            import datetime
+            date_folder = datetime.datetime.now().strftime("%Y_%m_%d")
+            target_path = self._normalize_openlist_path(f"{target_path.rstrip('/')}/{date_folder}")
+        except Exception as e:
+            logger.warning(f"生成年月日上传目录失败: {e}")
+
+        max_upload_size_mb = self._get_size_limit_mb(user_config, "max_upload_size", 100)
+        max_upload_size = max_upload_size_mb * 1024 * 1024 if max_upload_size_mb > 0 else 0
+        total = len(upload_segments)
+        success_count = 0
+        fail_count = 0
+
+        try:
+            async with self._create_openlist_client(user_config) as client:
+                # 确保上传目标目录存在（含年月日日期文件夹，已存在会自动跳过）
+                if target_path not in ("", "/"):
+                    await client.ensure_dir(target_path)
+                for index, segment in enumerate(upload_segments, start=1):
+                    item = await self._build_upload_item(None, cached_message, segment)
+                    original_name = item["name"]
+                    file_name = original_name
+                    file_size = item["size"]
+                    source_url = item["url"]
+
+                    if self.is_submit_mode(user_config):
+                        file_name = self._build_submit_filename(
+                            original_name.rpartition(".")[0],
+                            original_name,
+                            file_size,
+                        )
+
+                    if not source_url:
+                        fail_count += 1
+                        await notify(f"❌ 无法获取附件下载地址：{file_name}\n请重新发送该附件后再试。")
+                        continue
+
+                    if not self._is_extension_allowed(file_name, user_config):
+                        fail_count += 1
+                        await notify(f"🚫 已按设置过滤（后缀名不允许）：{file_name}")
+                        continue
+
+                    if file_size is None and max_upload_size_mb > 0:
+                        file_size = await self._probe_url_size(source_url, user_config)
+
+                    if max_upload_size_mb > 0:
+                        if file_size is None:
+                            fail_count += 1
+                            await notify(f"❌ 无法确认文件大小: {file_name}\n提示：当前上传大小限制为 {max_upload_size_mb}MB。")
+                            continue
+                        if file_size > max_upload_size:
+                            fail_count += 1
+                            size_mb = file_size / (1024 * 1024)
+                            await notify(f"❌ 文件过大：{file_name} {size_mb:.1f}MB > {max_upload_size_mb}MB")
+                            continue
+
+                    logger.info(f"[私聊自动上传] 开始上传 ({index}/{total}): {file_name}")
+                    success = await self._upload_url_stream_with_retry(
+                        client,
+                        source_url,
+                        target_path,
+                        file_name,
+                        file_size,
+                        user_config,
+                        refresh_url=item.get("refresh_url"),
+                    )
+                    if success:
+                        success_count += 1
+                    else:
+                        fail_count += 1
+                        logger.error(f"[私聊自动上传] 上传失败: {file_name}")
+
+                if success_count:
+                    await self._record_upload_log(client, target_path, user_id, "", user_config)
+                    self.cache_manager.clear_cache(user_id)
+                    result = await client.list_files(target_path)
+                    if result:
+                        files = result.get("content", [])
+                        self._update_user_navigation_state(nav_key, target_path, files)
+                        formatted_list = self._format_file_list(files, target_path, user_config, nav_key)
+                        await notify(f"📁 已上传到 {target_path}\n\n{formatted_list}")
+
+                if success_count or fail_count:
+                    await notify(f"✅ 私聊素材上传完成\n📊 统计: 总计 {total}, 成功 {success_count}, 失败 {fail_count}\n📂 目标: {target_path}")
+        except Exception as e:
+            logger.error(f"用户 {user_id} 私聊自动上传失败: {e}", exc_info=True)
+            await notify(f"❌ 私聊素材上传失败: {str(e)}")
 
     def _get_recent_upload_message(self, event: AstrMessageEvent) -> Optional[Dict]:
         self._prune_recent_upload_messages()
