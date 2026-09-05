@@ -556,6 +556,49 @@ class OpenlistPlugin(Star):
             normalized = "/" + normalized
         return normalized
 
+    def _get_display_root(self, user_id, user_config: Dict) -> str:
+        """计算当前用户在投稿模式下的“展示根目录”。
+
+        仅投稿开启时生效：
+        - 非白名单用户（投稿人）：展示根 = 自己的投稿文件夹 <submit_root>/<QQ>，
+          因此看到自己文件夹时显示为 /。
+        - 白名单用户（干事/干部）：展示根 = 投稿根的父目录 parent(submit_root)，
+          因此看到 <submit_root>/<QQ>（如 /cmcc/upload/2069528060）显示为
+          /upload/2069528060。
+        投稿未开启或无法确定时返回空串（表示不做裁剪、展示真实绝对路径）。
+        全部由配置动态推导，不写死路径。user_id 可为 nav_key(session key) 或原始QQ。
+        """
+        try:
+            if not self.is_submit_mode(user_config):
+                return ""
+            submit_root = self.get_submit_root(user_config)
+            if not submit_root:
+                return ""
+            uid = self._parse_sender_id(user_id) if user_id else ""
+            if not uid:
+                return ""
+            if not self.is_whitelisted_user(uid):
+                return self.get_user_submit_dir(submit_root, uid)
+            # 白名单：展示根 = 投稿根父目录
+            parent = posixpath.dirname(submit_root.rstrip("/")) or "/"
+            return self._normalize_openlist_path(parent)
+        except Exception as e:
+            logger.warning(f"计算展示根目录失败，将展示真实路径: {e}")
+            return ""
+
+    def _strip_display_root(self, full_path: str, display_root: str) -> str:
+        """把真实绝对路径裁剪成展示路径。display_root 为 '' 时不裁剪。"""
+        if not display_root:
+            return self._normalize_openlist_path(full_path)
+        p = self._normalize_openlist_path(full_path)
+        d = display_root.rstrip("/")
+        if p == d:
+            return "/"
+        if p.startswith(d + "/"):
+            return p[len(d):]
+        # 不在展示根内，原样返回（防御）
+        return p
+
     def _resolve_target_path(self, user_id: str, path: str, default_to_current: bool = True) -> str:
         """将目标路径解析为 OpenList 绝对路径，支持当前目录相对路径。
         投稿模式下自动限定在用户个人投稿目录内。"""
@@ -802,7 +845,11 @@ class OpenlistPlugin(Star):
     def _format_file_list(self, files: List[Dict], current_path: str, user_config: Dict, user_id: str = None) -> str:
         """格式化文件列表或搜索结果"""
         is_search_result = current_path.startswith("🔍 搜索")
-        title = f"📁 {current_path}" if not is_search_result else current_path
+        if is_search_result:
+            title = current_path
+        else:
+            display_root = self._get_display_root(user_id, user_config) if user_id else ""
+            title = f"📁 {self._strip_display_root(current_path, display_root)}"
 
         if not files: return f"{title}\n\n❌ 列表为空"
 
