@@ -382,9 +382,9 @@ class OpenlistPlugin(Star):
             return session_key.split(":user:", 1)[1]
         return session_key
 
-    def _get_submit_whitelist(self, global_cfg: Dict) -> List[str]:
-        """解析投稿白名单 Q 号列表（来自 WebUI submit_whitelist，逗号分隔）。"""
-        raw = (global_cfg.get("submit_whitelist") or "").strip()
+    def _parse_q_whitelist(self, raw_value) -> List[str]:
+        """把逗号分隔的 QQ 号字符串解析为列表。"""
+        raw = (raw_value or "").strip()
         if not raw:
             return []
         ids = []
@@ -394,8 +394,31 @@ class OpenlistPlugin(Star):
                 ids.append(part)
         return ids
 
+    def _get_submit_whitelist(self, global_cfg: Dict) -> List[str]:
+        """解析【高级白名单】Q 号列表（来自 WebUI submit_whitelist，逗号分隔）。"""
+        return self._parse_q_whitelist(global_cfg.get("submit_whitelist"))
+
+    def _get_submit_whitelist_normal(self) -> List[str]:
+        """解析【普通白名单】Q 号列表（来自本地 global_config.json 的 submit_whitelist_normal）。"""
+        try:
+            raw = self.global_config_manager.load_config().get("submit_whitelist_normal")
+        except Exception:
+            raw = ""
+        return self._parse_q_whitelist(raw)
+
     def is_whitelisted_user(self, user_id) -> bool:
-        """判断某用户是否为投稿白名单用户。"""
+        """判断某用户是否为投稿白名单用户（普通 或 高级 任一档）。"""
+        uid = str(user_id).strip()
+        if not uid:
+            return False
+        try:
+            global_cfg = self.get_global_config()
+        except Exception:
+            return False
+        return uid in self._get_submit_whitelist(global_cfg) or uid in self._get_submit_whitelist_normal()
+
+    def is_advanced_whitelisted_user(self, user_id) -> bool:
+        """判断某用户是否为【高级白名单】用户（仅高级可执行 白名单 增删指令）。"""
         uid = str(user_id).strip()
         if not uid:
             return False
@@ -1006,6 +1029,111 @@ class OpenlistPlugin(Star):
             return
         async for result in self.browse_service.mkdir_command(event, name):
             yield result
+
+    @openlist_group.command("白名单")
+    async def whitelist_command(self, event: AstrMessageEvent, action: str = "", qq: str = ""):
+        """管理【普通白名单】（仅高级白名单用户可执行）。
+
+        示例：
+          素材 白名单 增加 10001
+          素材 白名单 增加10001
+          素材 白名单 删除 10001
+          素材 白名单 删除10001
+          素材 白名单 查看
+        """
+        user_id = event.get_sender_id()
+        # 1) 仅高级白名单用户可执行
+        if not self.is_advanced_whitelisted_user(user_id):
+            yield "🔒 白名单增删指令仅限【高级白名单】用户使用。\n💡 普通白名单与普通用户在投稿权限上相同，仅高级白名单可管理白名单。"
+            return
+
+        # 2) 解析动作与 QQ（兼容 “增加10001” 无空格 与 “增加 10001” 带空格）
+        action = (action or "").strip()
+        qq = (qq or "").strip()
+        if not action:
+            # 可能是 "增加10001" 被当作单个参数落入 qq
+            if qq:
+                action, qq = self._split_whitelist_action(qq)
+        else:
+            # 处理 “增加10001” 形式：动作后直接跟数字
+            action, tail = self._split_whitelist_action(action)
+            if not qq and tail:
+                qq = tail
+
+        if action in ("查看", "list", "显示"):
+            yield self._whitelist_status_text()
+            return
+
+        if action not in ("增加", "添加", "add", "删除", "移除", "del", "remove"):
+            yield self._whitelist_usage_tip()
+            return
+
+        qq = qq.strip()
+        if not qq or not qq.isdigit():
+            yield self._whitelist_usage_tip()
+            return
+
+        is_add = action in ("增加", "添加", "add")
+        normal = self._get_submit_whitelist_normal()
+        existed = qq in normal
+        if is_add:
+            if existed:
+                yield f"ℹ️ QQ {qq} 已在普通白名单中，无需重复添加。"
+                return
+            normal.append(qq)
+            self._set_submit_whitelist_normal(normal)
+            yield f"✅ 已将 QQ {qq} 加入普通白名单。\n📋 当前普通白名单: {self._format_q_list(normal)}"
+        else:
+            if not existed:
+                yield f"ℹ️ QQ {qq} 不在普通白名单中，无需删除。"
+                return
+            normal.remove(qq)
+            self._set_submit_whitelist_normal(normal)
+            yield f"✅ 已从普通白名单移除 QQ {qq}。\n📋 当前普通白名单: {self._format_q_list(normal)}"
+
+    def _split_whitelist_action(self, raw: str):
+        """从形如 “增加10001”/“删除10001” 中拆出动作与 QQ；否则原样返回。"""
+        raw = (raw or "").strip()
+        for keyword in ("增加", "添加", "add", "删除", "移除", "del", "remove"):
+            if raw.lower().startswith(keyword.lower()):
+                tail = raw[len(keyword):].strip()
+                return keyword, tail
+        return raw, ""
+
+    def _whitelist_usage_tip(self):
+        return (
+            "📋 白名单管理指令用法：\n"
+            "  素材 白名单 增加 10001     （加入普通白名单）\n"
+            "  素材 白名单 删除 10001     （移除普通白名单）\n"
+            "  素材 白名单 查看            （查看当前白名单）\n"
+            "💡 仅【高级白名单】用户可执行本指令；普通白名单通过本指令管理，高级白名单只能在 WebUI 设置。"
+        )
+
+    def _whitelist_status_text(self):
+        try:
+            global_cfg = self.get_global_config()
+        except Exception:
+            global_cfg = {}
+        advanced = self._get_submit_whitelist(global_cfg)
+        normal = self._get_submit_whitelist_normal()
+        return (
+            "📋 白名单状态：\n"
+            f"🔺 高级白名单(仅WebUI): {self._format_q_list(advanced)}\n"
+            f"🔹 普通白名单(指令管理): {self._format_q_list(normal)}"
+        )
+
+    def _set_submit_whitelist_normal(self, qq_list):
+        """把普通白名单写回本地 global_config.json。"""
+        raw = ",".join(qq_list)
+        try:
+            cfg = self.global_config_manager.load_config()
+            cfg["submit_whitelist_normal"] = raw
+            self.global_config_manager.save_config(cfg)
+        except Exception as e:
+            logger.error(f"保存普通白名单失败: {e}", exc_info=True)
+
+    def _format_q_list(self, qq_list):
+        return ", ".join(qq_list) if qq_list else "（空）"
 
     @openlist_group.command("帮助")
     async def help_command(self, event: AstrMessageEvent):

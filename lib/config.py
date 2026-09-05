@@ -184,6 +184,7 @@ class GlobalConfigManager:
             "debug_transfer_logging": False,
             "default_submit_path": "",
             "submit_whitelist": "",
+            "submit_whitelist_normal": "",
         }
 
     def load_config(self) -> Dict:
