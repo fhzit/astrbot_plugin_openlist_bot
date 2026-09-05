@@ -325,6 +325,33 @@ class OpenlistPlugin(Star):
         require_auth = global_cfg.get("require_user_auth", True)
         if not default_url and not require_auth:
             logger.warning("Openlist URL未配置，请使用 素材 配置 命令配置或在WebUI中配置")
+        # 后台补齐白名单用户账户（含 WebUI 新增的高级白名单用户）
+        asyncio.create_task(self._reconcile_whitelist_accounts())
+
+    async def _reconcile_whitelist_accounts(self):
+        """扫描全部白名单用户（高级+普通），为缺失的 OpenList 账户自动创建。
+
+        在插件加载/WebUI 热重载时执行，保证 WebUI 新增的高级白名单用户也有账户。
+        """
+        try:
+            global_cfg = self.get_global_config()
+        except Exception as e:
+            logger.error(f"账户对账失败(读取配置): {e}", exc_info=True)
+            return
+        advanced = self._get_submit_whitelist(global_cfg)
+        normal = self._get_submit_whitelist_normal()
+        all_whitelist = list(dict.fromkeys([str(q).strip() for q in (advanced + normal) if str(q).strip()]))
+        for qq in all_whitelist:
+            try:
+                if self.account_service._stored_account(qq):
+                    continue
+                acct = await self.account_service.create_account(qq)
+                if acct.get("ok"):
+                    logger.info(f"账户对账：已自动创建/纳入 QQ {qq} 的 OpenList 账户")
+                else:
+                    logger.warning(f"账户对账：QQ {qq} 建号失败 - {acct.get('message')}")
+            except Exception as e:
+                logger.error(f"账户对账：QQ {qq} 异常: {e}", exc_info=True)
 
     def get_user_config_manager(self, user_id: str) -> UserConfigManager:
         """获取用户配置管理器"""
