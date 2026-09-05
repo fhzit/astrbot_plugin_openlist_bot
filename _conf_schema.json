@@ -160,47 +160,11 @@
                 "default": true,
                 "hint": "启用后每个用户需要独立配置"
             },
-            "backup_default_path": {
-                "description": "手动备份默认目录",
+            "default_submit_path": {
+                "description": "投稿模式默认根路径",
                 "type": "string",
-                "default": "/backup/group_{group_id}",
-                "hint": "使用 ol backup 且未指定路径时的 OpenList 目录。支持 {group_id}、{gid}、{group} 占位符。"
-            },
-            "autobackup_default_path": {
-                "description": "自动备份默认目录",
-                "type": "string",
-                "default": "/backup/group_{group_id}",
-                "hint": "执行 ol autobackup enable 且未传路径时使用。启用群聊请通过 ol autobackup show/enable/disable 管理。支持 {group_id}、{gid}、{group} 占位符。"
-            },
-            "backup_allowed_extensions": {
-                "description": "备份允许的文件扩展名",
-                "type": "text",
                 "default": "",
-                "hint": "用逗号分隔，如: .txt,.pdf。留空表示不限制。"
-            },
-            "backup_max_size": {
-                "description": "备份单个文件大小上限(MB)",
-                "type": "int",
-                "default": 0,
-                "hint": "0 表示不限制。"
-            },
-            "backup_skip_existing": {
-                "description": "跳过已存在备份文件",
-                "type": "bool",
-                "default": true,
-                "hint": "开启后，目标目录已有同名且大小一致的文件时不再重复上传。"
-            },
-            "backup_retry_attempts": {
-                "description": "备份单文件尝试次数",
-                "type": "int",
-                "default": 3,
-                "hint": "每个群文件备份失败时最多尝试次数，包含首次尝试。"
-            },
-            "backup_retry_delay": {
-                "description": "备份重试间隔(秒)",
-                "type": "int",
-                "default": 5,
-                "hint": "同一文件两次备份尝试之间的等待时间。"
+                "hint": "开启投稿隔离：填写 OpenList 目录（如 /submit），开启后每个用户只能在其个人子文件夹（/submit/<QQ号>）内 素材 列表/下载/上传 等操作，无法退出或访问其他目录。留空表示关闭投稿隔离。"
             }
         }
     }

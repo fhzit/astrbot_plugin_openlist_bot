@@ -17,14 +17,23 @@ class BrowseService(PluginService):
         if not self._validate_config(user_config):
             yield event.plain_result(self._format_usage_tip(
                 "请先配置 OpenList 连接信息",
-                "ol config setup",
+                "素材 配置 向导",
                 [
-                    "ol config setup",
-                    "ol config set openlist_url http://127.0.0.1:5244",
-                    "ol config test",
+                    "素材 配置 向导",
+                    "素材 配置 设置 openlist_url http://127.0.0.1:5244",
+                    "素材 配置 测试",
                 ],
             ))
             return
+        # 投稿模式：确保个人目录存在并从个人目录开始
+        if self.is_submit_mode(user_config):
+            await self._ensure_user_folder_for_event(event, user_config)
+            nav_state = self._get_user_navigation_state(nav_key)
+            user_dir = self.get_user_submit_dir(self.get_submit_root(user_config), user_id)
+            current = nav_state.get("current_path", "/")
+            if not (current == user_dir or current.startswith(user_dir.rstrip("/") + "/")):
+                nav_state["current_path"] = user_dir
+                nav_state["parent_paths"] = []
         path = (path or "").strip()
         target_path = self._resolve_target_path(nav_key, path)
         path_candidates = [target_path]
@@ -42,9 +51,9 @@ class BrowseService(PluginService):
             else:
                 yield event.plain_result(self._format_usage_tip(
                     f"序号 {number} 无效",
-                    "ol ls [路径|序号]",
-                    ["ol ls", "ol ls /movies", "ol ls 1"],
-                    "序号来自当前会话最近一次 ol ls 或 ol search 的列表。",
+                    "素材 列表 [路径|序号]",
+                    ["素材 列表", "素材 列表 /movies", "素材 列表 1"],
+                    "序号来自当前会话最近一次 素材 列表 或 素材 搜索 的列表。",
                 ))
                 return
         else:
@@ -88,8 +97,8 @@ class BrowseService(PluginService):
                 logger.warning(f"用户 {user_id} 无法访问路径候选: {display_path}")
                 yield event.plain_result(self._format_usage_tip(
                     f"无法访问路径：{display_path}",
-                    "ol ls [OpenList路径]",
-                    ["ol ls", "ol ls /movies", "ol ls docs"],
+                    "素材 列表 [OpenList路径]",
+                    ["素材 列表", "素材 列表 /movies", "素材 列表 docs"],
                     "不以 / 开头时，会优先按当前目录的相对路径解析。",
                 ))
         except Exception as e:
@@ -103,7 +112,7 @@ class BrowseService(PluginService):
         user_config = self.get_user_config(user_id)
         nav_state = self._get_user_navigation_state(nav_key)
         if not nav_state.get("items"):
-            yield event.plain_result("🤔 没有可供翻页的列表，请先使用 ol ls 查看一个目录。")
+            yield event.plain_result("🤔 没有可供翻页的列表，请先使用 素材 列表 查看一个目录。")
             return
         current_page = nav_state.get("current_page", 1)
         all_items = nav_state.get("items", [])
@@ -128,7 +137,7 @@ class BrowseService(PluginService):
         user_config = self.get_user_config(user_id)
         nav_state = self._get_user_navigation_state(nav_key)
         if not nav_state.get("items"):
-            yield event.plain_result("🤔 没有可供翻页的列表，请先使用 ol ls 查看一个目录。")
+            yield event.plain_result("🤔 没有可供翻页的列表，请先使用 素材 列表 查看一个目录。")
             return
         current_page = nav_state.get("current_page", 1)
         all_items = nav_state.get("items", [])
@@ -151,8 +160,8 @@ class BrowseService(PluginService):
         if not keyword:
             yield event.plain_result(self._format_usage_tip(
                 "缺少搜索关键词",
-                "ol search <关键词> [目录]",
-                ["ol search 年度报告", "ol search 年度报告 /documents"],
+                "素材 搜索 <关键词> [目录]",
+                ["素材 搜索 年度报告", "素材 搜索 年度报告 /documents"],
                 "搜索依赖 OpenList 服务器索引，结果可能不是最新。",
             ))
             return
@@ -163,11 +172,11 @@ class BrowseService(PluginService):
         if not self._validate_config(user_config):
             yield event.plain_result(self._format_usage_tip(
                 "请先配置 OpenList 连接信息",
-                "ol config setup",
+                "素材 配置 向导",
                 [
-                    "ol config setup",
-                    "ol config set openlist_url http://127.0.0.1:5244",
-                    "ol config test",
+                    "素材 配置 向导",
+                    "素材 配置 设置 openlist_url http://127.0.0.1:5244",
+                    "素材 配置 测试",
                 ],
             ))
             return
@@ -194,9 +203,9 @@ class BrowseService(PluginService):
         if not path:
             yield event.plain_result(self._format_usage_tip(
                 "缺少文件路径",
-                "ol info <路径>",
-                ["ol info /docs/report.pdf", "ol info /movies"],
-                "info 暂不支持序号；如需查看当前列表文件，请复制列表中的路径。",
+                "素材 信息 <路径>",
+                ["素材 信息 /docs/report.pdf", "素材 信息 /movies"],
+                "信息 暂不支持序号；如需查看当前列表文件，请复制列表中的路径。",
             ))
             return
         user_id = event.get_sender_id()
@@ -205,11 +214,11 @@ class BrowseService(PluginService):
         if not self._validate_config(user_config):
             yield event.plain_result(self._format_usage_tip(
                 "请先配置 OpenList 连接信息",
-                "ol config setup",
+                "素材 配置 向导",
                 [
-                    "ol config setup",
-                    "ol config set openlist_url http://127.0.0.1:5244",
-                    "ol config test",
+                    "素材 配置 向导",
+                    "素材 配置 设置 openlist_url http://127.0.0.1:5244",
+                    "素材 配置 测试",
                 ],
             ))
             return
@@ -253,9 +262,9 @@ class BrowseService(PluginService):
                     logger.warning(f"用户 {user_id} 文件不存在: {display_path}")
                     yield event.plain_result(self._format_usage_tip(
                         f"文件不存在：{display_path}",
-                        "ol info <OpenList路径>",
-                        ["ol info /docs/report.pdf", "ol info /movies"],
-                        "info 暂不支持序号；可以先用 ol ls 查看路径。",
+                        "素材 信息 <OpenList路径>",
+                        ["素材 信息 /docs/report.pdf", "素材 信息 /movies"],
+                        "信息 暂不支持序号；可以先用 素材 列表 查看路径。",
                     ))
         except Exception as e:
             logger.error(f"用户 {user_id} 获取文件信息失败: {e}, 路径候选: {path_candidates}", exc_info=True)
@@ -267,9 +276,9 @@ class BrowseService(PluginService):
         if not path:
             yield event.plain_result(self._format_usage_tip(
                 "缺少文件路径或序号",
-                "ol download <路径|序号>",
-                ["ol download 2", "ol download /movies/Inception.mkv"],
-                "序号来自当前会话最近一次 ol ls 或 ol search 的列表。",
+                "素材 下载 <路径|序号>",
+                ["素材 下载 2", "素材 下载 /movies/Inception.mkv"],
+                "序号来自当前会话最近一次 素材 列表 或 素材 搜索 的列表。",
             ))
             return
         user_id = event.get_sender_id()
@@ -278,11 +287,11 @@ class BrowseService(PluginService):
         if not self._validate_config(user_config):
             yield event.plain_result(self._format_usage_tip(
                 "请先配置 OpenList 连接信息",
-                "ol config setup",
+                "素材 配置 向导",
                 [
-                    "ol config setup",
-                    "ol config set openlist_url http://127.0.0.1:5244",
-                    "ol config test",
+                    "素材 配置 向导",
+                    "素材 配置 设置 openlist_url http://127.0.0.1:5244",
+                    "素材 配置 测试",
                 ],
             ))
             return
@@ -297,18 +306,18 @@ class BrowseService(PluginService):
                 if item.get("is_dir", False):
                     yield event.plain_result(self._format_usage_tip(
                         f"序号 {number} 是目录，无法下载",
-                        "ol download <文件路径|文件序号>",
-                        ["ol download 3", "ol download /docs/report.pdf"],
-                        "如需进入目录，请使用 ol ls 序号。",
+                        "素材 下载 <文件路径|文件序号>",
+                        ["素材 下载 3", "素材 下载 /docs/report.pdf"],
+                        "如需进入目录，请使用 素材 列表 序号。",
                     ))
                     return
                 item_to_download = item
             else:
                 yield event.plain_result(self._format_usage_tip(
                     f"序号 {number} 无效",
-                    "ol download <路径|序号>",
-                    ["ol ls", "ol download 2", "ol download /movies/video.mp4"],
-                    "序号来自当前会话最近一次 ol ls 或 ol search 的列表。",
+                    "素材 下载 <路径|序号>",
+                    ["素材 列表", "素材 下载 2", "素材 下载 /movies/video.mp4"],
+                    "序号来自当前会话最近一次 素材 列表 或 素材 搜索 的列表。",
                 ))
                 return
         else:
@@ -325,9 +334,9 @@ class BrowseService(PluginService):
                         display_path = " / ".join(path_candidates)
                         yield event.plain_result(self._format_usage_tip(
                             f"无法下载：文件不存在或路径为目录：{display_path}",
-                            "ol download <文件路径|文件序号>",
-                            ["ol download 2", "ol download /docs/report.pdf"],
-                            "目录不能直接下载；如需查看目录内容，请使用 ol ls 路径。",
+                            "素材 下载 <文件路径|文件序号>",
+                            ["素材 下载 2", "素材 下载 /docs/report.pdf"],
+                            "目录不能直接下载；如需查看目录内容，请使用 素材 列表 路径。",
                         ))
                         return
             except Exception as e:
@@ -348,19 +357,29 @@ class BrowseService(PluginService):
         if not self._validate_config(user_config):
             yield event.plain_result(self._format_usage_tip(
                 "请先配置 OpenList 连接信息",
-                "ol config setup",
+                "素材 配置 向导",
                 [
-                    "ol config setup",
-                    "ol config set openlist_url http://127.0.0.1:5244",
-                    "ol config test",
+                    "素材 配置 向导",
+                    "素材 配置 设置 openlist_url http://127.0.0.1:5244",
+                    "素材 配置 测试",
                 ],
             ))
             return
         nav_state = self._get_user_navigation_state(nav_key)
+        # 投稿模式：禁止回退到个人投稿目录之外
+        if self.is_submit_mode(user_config):
+            user_dir = self.get_user_submit_dir(self.get_submit_root(user_config), user_id)
+            if nav_state.get("current_path") in (None, "", user_dir):
+                yield event.plain_result("🔒 你已在个人投稿文件夹根目录，无法继续回退。")
+                return
         if not nav_state["parent_paths"]:
             yield event.plain_result("📂 已经在根目录，无法继续回退。")
             return
         previous_path = nav_state["parent_paths"].pop()
+        # 投稿模式：回退目标也限定在个人投稿目录内（防御）
+        if self.is_submit_mode(user_config):
+            submit_root = self.get_submit_root(user_config)
+            previous_path = self._clamp_to_user_submit_dir(previous_path, submit_root, user_id)
         try:
             async with self._create_openlist_client(user_config) as client:
                 result = await client.list_files(previous_path)
@@ -383,8 +402,8 @@ class BrowseService(PluginService):
         if not path:
             yield event.plain_result(self._format_usage_tip(
                 "缺少要删除的路径或序号",
-                "ol rm <路径|序号>",
-                ["ol rm 4", "ol rm /temp/stale_file.txt"],
+                "素材 删除 <路径|序号>",
+                ["素材 删除 4", "素材 删除 /temp/stale_file.txt"],
                 "删除操作不可恢复；序号来自当前会话最近一次列表。",
             ))
             return
@@ -394,11 +413,11 @@ class BrowseService(PluginService):
         if not self._validate_config(user_config):
             yield event.plain_result(self._format_usage_tip(
                 "请先配置 OpenList 连接信息",
-                "ol config setup",
+                "素材 配置 向导",
                 [
-                    "ol config setup",
-                    "ol config set openlist_url http://127.0.0.1:5244",
-                    "ol config test",
+                    "素材 配置 向导",
+                    "素材 配置 设置 openlist_url http://127.0.0.1:5244",
+                    "素材 配置 测试",
                 ],
             ))
             return
@@ -421,8 +440,8 @@ class BrowseService(PluginService):
             else:
                 yield event.plain_result(self._format_usage_tip(
                     f"序号 {number} 无效",
-                    "ol rm <路径|序号>",
-                    ["ol ls", "ol rm 4", "ol rm /temp/stale_file.txt"],
+                    "素材 删除 <路径|序号>",
+                    ["素材 列表", "素材 删除 4", "素材 删除 /temp/stale_file.txt"],
                     "序号来自当前会话最近一次列表；删除操作不可恢复。",
                 ))
                 return
@@ -490,8 +509,8 @@ class BrowseService(PluginService):
         if not name:
             yield event.plain_result(self._format_usage_tip(
                 "缺少文件夹名称或路径",
-                "ol mkdir <名称|路径>",
-                ["ol mkdir new_folder", "ol mkdir /data/new_dir"],
+                "素材 新建 <名称|路径>",
+                ["素材 新建 new_folder", "素材 新建 /data/new_dir"],
                 "不以 / 开头时，会在当前会话的当前目录下创建。",
             ))
             return
@@ -501,11 +520,11 @@ class BrowseService(PluginService):
         if not self._validate_config(user_config):
             yield event.plain_result(self._format_usage_tip(
                 "请先配置 OpenList 连接信息",
-                "ol config setup",
+                "素材 配置 向导",
                 [
-                    "ol config setup",
-                    "ol config set openlist_url http://127.0.0.1:5244",
-                    "ol config test",
+                    "素材 配置 向导",
+                    "素材 配置 设置 openlist_url http://127.0.0.1:5244",
+                    "素材 配置 测试",
                 ],
             ))
             return

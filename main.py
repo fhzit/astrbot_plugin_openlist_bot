@@ -12,7 +12,6 @@ from astrbot.api.message_components import File
 from astrbot.api import logger
 from .lib.client import OpenlistClient
 from .lib.config import (
-    AUTOBACKUP_GROUPS_WEBUI_MIGRATION_KEY,
     EXTENSION_CONFIG_KEYS,
     GLOBAL_LEGACY_CONFIG_KEYS,
     WEBUI_CONFIG_MAPPING,
@@ -20,7 +19,7 @@ from .lib.config import (
     GlobalConfigManager,
 )
 from .lib.cache import CacheManager
-from .services import BackupService, BrowseService, ConfigCommandService, DownloadService, HelpService, PreviewService, RestoreService, UploadService
+from .services import BrowseService, ConfigCommandService, DownloadService, HelpService, PreviewService, UploadService
 
 
 class OpenlistPlugin(Star):
@@ -38,13 +37,10 @@ class OpenlistPlugin(Star):
         self.recent_upload_messages = {}
         self.upload_service = UploadService(self)
         self.download_service = DownloadService(self)
-        self.backup_service = BackupService(self)
         self.browse_service = BrowseService(self)
         self.config_command_service = ConfigCommandService(self)
-        self.restore_service = RestoreService(self)
         self.preview_service = PreviewService(self)
         self.help_service = HelpService(self)
-        self.autobackup_semaphore = asyncio.Semaphore(2)
 
     def get_webui_config(self, key: str, default=None):
         """获取WebUI配置项"""
@@ -317,78 +313,14 @@ class OpenlistPlugin(Star):
 
         return self._is_admin_role(self._extract_sender_role(event))
 
-    def _autobackup_entry_group_id(self, item) -> Optional[str]:
-        """解析自动备份群配置项中的群号。"""
-        if not isinstance(item, str):
-            return None
-        item = item.strip()
-        if not item:
-            return None
-        gid = item.split(":", 1)[0] if ":" in item else item
-        gid = gid.strip()
-        return gid or None
-
-    def _normalize_autobackup_group_entries(self, groups) -> List[str]:
-        """清理自动备份群配置项，并按群号去重保序。"""
-        if not isinstance(groups, list):
-            return []
-        normalized = []
-        seen_gids = set()
-        for item in groups:
-            item = str(item).strip()
-            gid = self._autobackup_entry_group_id(item)
-            if not gid or gid in seen_gids:
-                continue
-            normalized.append(item)
-            seen_gids.add(gid)
-        return normalized
-
-    def _migrate_autobackup_groups_from_webui(self):
-        """将旧版 WebUI 自动备份群配置一次性迁移到本地运行时配置。"""
-        webui_groups = self._normalize_autobackup_group_entries(
-            self.get_webui_config("autobackup_groups", [])
-        )
-        if not webui_groups:
-            return
-
-        local_cfg = self.global_config_manager.load_config()
-        if local_cfg.get(AUTOBACKUP_GROUPS_WEBUI_MIGRATION_KEY):
-            return
-
-        local_groups = self._normalize_autobackup_group_entries(
-            local_cfg.get("autobackup_groups", [])
-        )
-        existing_gids = {
-            gid for gid in (self._autobackup_entry_group_id(item) for item in local_groups)
-            if gid
-        }
-        combined = list(local_groups)
-        migrated_count = 0
-        for item in webui_groups:
-            gid = self._autobackup_entry_group_id(item)
-            if not gid or gid in existing_gids:
-                continue
-            combined.append(item)
-            existing_gids.add(gid)
-            migrated_count += 1
-
-        local_cfg["autobackup_groups"] = combined
-        local_cfg[AUTOBACKUP_GROUPS_WEBUI_MIGRATION_KEY] = True
-        self.global_config_manager.save_config(local_cfg)
-        logger.info(
-            f"已完成 WebUI autobackup_groups 一次性迁移: "
-            f"webui={len(webui_groups)}, added={migrated_count}, total={len(combined)}"
-        )
-
     async def initialize(self):
         """插件初始化"""
         logger.info("Openlist文件管理插件已加载")
-        self._migrate_autobackup_groups_from_webui()
         global_cfg = self.get_global_config()
         default_url = global_cfg.get("openlist_url", "")
         require_auth = global_cfg.get("require_user_auth", True)
         if not default_url and not require_auth:
-            logger.warning("Openlist URL未配置，请使用 ol config 命令配置或在WebUI中配置")
+            logger.warning("Openlist URL未配置，请使用 素材 配置 命令配置或在WebUI中配置")
 
     def get_user_config_manager(self, user_id: str) -> UserConfigManager:
         """获取用户配置管理器"""
@@ -429,6 +361,63 @@ class OpenlistPlugin(Star):
         """验证配置是否有效"""
         return bool(user_config.get("openlist_url"))
 
+    def get_submit_root(self, user_config: Dict) -> str:
+        """返回投稿模式根路径（已归一化），未开启投稿隔离时返回空字符串。"""
+        root = (user_config.get("default_submit_path") or "").strip()
+        return self._normalize_openlist_path(root) if root else ""
+
+    def is_submit_mode(self, user_config: Dict) -> bool:
+        """是否开启投稿模式（投稿隔离）。"""
+        return bool(self.get_submit_root(user_config))
+
+    def get_user_submit_dir(self, submit_root: str, sender_id) -> str:
+        """返回投稿隔离下某用户的个人目录：<root>/<QQ号>。"""
+        return self._normalize_openlist_path(f"{submit_root.rstrip('/')}/{sender_id}")
+
+    def _parse_sender_id(self, session_key: str) -> str:
+        """从会话 key（nav_key）中解析真实发送者 QQ。格式：
+        group:<gid>:user:<uid>  或  private:user:<uid>
+        """
+        if ":user:" in session_key:
+            return session_key.split(":user:", 1)[1]
+        return session_key
+
+    def _clamp_to_user_submit_dir(self, resolved_path: str, submit_root: str, sender_id: str) -> str:
+        """把解析出的路径限制到投稿用户个人目录内；根目录/他人目录一律拉回个人目录。"""
+        user_dir = self.get_user_submit_dir(submit_root, sender_id)
+        p = self._normalize_openlist_path(resolved_path)
+        ulist = user_dir.rstrip("/")
+        if p.startswith(ulist + "/") or p == ulist:
+            return p
+        # 回到根、越权到其他用户/根目录下 → 一律回个人目录
+        return user_dir
+
+    def _submit_deny_if_applicable(self, event) -> Optional[str]:
+        """投稿模式下屏蔽越权指令；未开启投稿模式返回 None。"""
+        try:
+            user_config = self.get_user_config(event.get_sender_id())
+        except Exception:
+            user_config = {}
+        if not self.is_submit_mode(user_config):
+            return None
+        return (
+            "🔒 投稿模式已开启：你只能使用 素材 列表 / 素材 下载 / 素材 上传 / 素材 配置 / 素材 帮助 等命令，"
+            "且仅能访问自己的投稿文件夹。删除、新建目录、搜索等命令在投稿模式下不可用。"
+        )
+
+    async def _ensure_user_folder_for_event(self, event, user_config: Dict) -> str:
+        """确保投稿用户个人目录存在（自动新建 <root>/<QQ号>），返回个人目录。投稿未开启时返回 ''。"""
+        submit_root = self.get_submit_root(user_config)
+        if not submit_root:
+            return ""
+        user_dir = self.get_user_submit_dir(submit_root, event.get_sender_id())
+        try:
+            async with self._create_openlist_client(user_config) as client:
+                await client.ensure_dir(user_dir)
+        except Exception as e:
+            logger.warning(f"投稿目录自动创建失败: {user_dir}, err={e}")
+        return user_dir
+
     def _get_user_navigation_state(self, user_id: str) -> Dict:
         """获取用户导航状态"""
         if user_id not in self.user_navigation_state:
@@ -437,6 +426,7 @@ class OpenlistPlugin(Star):
                 "items": [],
                 "parent_paths": [],
                 "current_page": 1,
+                "_session_key": user_id,
             }
         return self.user_navigation_state[user_id]
 
@@ -464,53 +454,6 @@ class OpenlistPlugin(Star):
             return items[number - 1]
         return None
 
-    def _get_backup_retry_key(self, event: AstrMessageEvent) -> str:
-        """按会话和用户定位最近一次手动备份失败项。"""
-        user_id = event.get_sender_id()
-        message_obj = getattr(event, "message_obj", None)
-        group_id = getattr(message_obj, "group_id", None)
-        if group_id:
-            return f"group:{group_id}:user:{user_id}"
-        return f"private:user:{user_id}"
-
-    def _get_backup_retry_file(self, retry_key: str) -> str:
-        """返回备份失败清单临时文件路径。"""
-        safe_key = "".join(c if c.isalnum() or c in "._-" else "_" for c in retry_key)
-        retry_dir = os.path.join(StarTools.get_data_dir("openlist"), "backup_retry")
-        os.makedirs(retry_dir, exist_ok=True)
-        return os.path.join(retry_dir, f"{safe_key}.json")
-
-    def _load_backup_retry_state(self, retry_key: str) -> Optional[Dict]:
-        """读取最近一次备份失败清单。"""
-        retry_file = self._get_backup_retry_file(retry_key)
-        try:
-            if not os.path.exists(retry_file):
-                return None
-            with open(retry_file, "r", encoding="utf-8") as f:
-                state = json.load(f)
-            return state if isinstance(state, dict) else None
-        except Exception as e:
-            logger.warning(f"读取备份失败清单失败: {retry_file}, err={e}")
-            return None
-
-    def _save_backup_retry_state(self, retry_key: str, state: Dict):
-        """写入备份失败清单临时文件。"""
-        retry_file = self._get_backup_retry_file(retry_key)
-        try:
-            with open(retry_file, "w", encoding="utf-8") as f:
-                json.dump(state, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.warning(f"保存备份失败清单失败: {retry_file}, err={e}")
-
-    def _delete_backup_retry_state(self, retry_key: str):
-        """删除备份失败清单临时文件。"""
-        retry_file = self._get_backup_retry_file(retry_key)
-        try:
-            if os.path.exists(retry_file):
-                os.remove(retry_file)
-        except OSError as e:
-            logger.warning(f"删除备份失败清单失败: {retry_file}, err={e}")
-
     def _normalize_openlist_path(self, path: str) -> str:
         """标准化 OpenList 路径，统一为以 / 开头的绝对路径。"""
         normalized = (path or "").strip().replace("\\", "/")
@@ -528,25 +471,49 @@ class OpenlistPlugin(Star):
         return normalized
 
     def _resolve_target_path(self, user_id: str, path: str, default_to_current: bool = True) -> str:
-        """将目标路径解析为 OpenList 绝对路径，支持当前目录相对路径。"""
+        """将目标路径解析为 OpenList 绝对路径，支持当前目录相对路径。
+        投稿模式下自动限定在用户个人投稿目录内。"""
         raw_path = (path or "").strip()
-        current_path = self._get_user_navigation_state(user_id)["current_path"]
+        nav_state = self._get_user_navigation_state(user_id)
+        current_path = nav_state["current_path"]
         if not isinstance(current_path, str) or not current_path.startswith("/"):
             current_path = "/"
 
+        resolved = ""
         if not raw_path:
             if default_to_current:
-                return self._normalize_openlist_path(current_path)
-            return "/"
+                resolved = self._normalize_openlist_path(current_path)
+            else:
+                resolved = "/"
+        elif raw_path.startswith("/"):
+            resolved = self._normalize_openlist_path(raw_path)
+        else:
+            current_path = self._normalize_openlist_path(current_path)
+            resolved = self._normalize_openlist_path(f"{current_path.rstrip('/')}/{raw_path}")
 
-        if raw_path.startswith("/"):
-            return self._normalize_openlist_path(raw_path)
+        # 投稿模式：把解析结果限定到用户个人投稿目录
+        submit_root, sender_id = self._submit_context(nav_state)
+        if submit_root:
+            return self._clamp_to_user_submit_dir(resolved, submit_root, sender_id)
+        return resolved
 
-        current_path = self._normalize_openlist_path(current_path)
-        return self._normalize_openlist_path(f"{current_path.rstrip('/')}/{raw_path}")
+    def _submit_context(self, nav_state: Dict):
+        """根据导航状态推导 (submit_root, sender_id)；未开启投稿隔离返回 ("", sender_id)。"""
+        try:
+            sender_id = self._parse_sender_id(nav_state.get("_session_key", ""))
+        except Exception:
+            sender_id = ""
+        try:
+            global_cfg = self.get_global_config()
+            submit_root = self.get_submit_root(global_cfg)
+        except Exception as e:
+            logger.debug(f"读取投稿配置失败: {e}")
+            submit_root = ""
+        return submit_root, sender_id
 
     def _resolve_path_candidates(self, user_id: str, path: str, default_to_current: bool = True) -> List[str]:
-        """生成候选路径: 先当前目录相对路径，再尝试根目录路径（用于兼容旧用法）。"""
+        """生成候选路径: 先当前目录相对路径，再尝试根目录路径（用于兼容旧用法）。
+        投稿模式下统一限定在用户个人投稿目录。"""
         raw_path = (path or "").strip()
         primary_path = self._resolve_target_path(user_id, raw_path, default_to_current=default_to_current)
         candidates = [primary_path]
@@ -554,6 +521,20 @@ class OpenlistPlugin(Star):
             root_path = self._normalize_openlist_path(raw_path)
             if root_path not in candidates:
                 candidates.append(root_path)
+
+        # 投稿模式下，候选路径全部拉回用户个人投稿目录，避免越权
+        nav_state = self._get_user_navigation_state(user_id)
+        submit_root, sender_id = self._submit_context(nav_state)
+        if submit_root:
+            candidates = [self._clamp_to_user_submit_dir(c, submit_root, sender_id) for c in candidates]
+            # 去重保序
+            seen = set()
+            dedup = []
+            for c in candidates:
+                if c not in seen:
+                    seen.add(c)
+                    dedup.append(c)
+            candidates = dedup
         return candidates
 
     def _strip_fixed_base_directory(self, path: str, user_config: Dict) -> str:
@@ -569,17 +550,24 @@ class OpenlistPlugin(Star):
         return self._normalize_openlist_path(path)
 
     def _get_item_full_path(self, user_id: str, item: Dict, user_config: Dict) -> str:
-        """根据列表项生成 OpenList 绝对路径，兼容普通列表和搜索结果。"""
+        """根据列表项生成 OpenList 绝对路径，兼容普通列表和搜索结果。
+        投稿模式下限定在用户个人投稿目录内。"""
         item_name = item.get("name", "")
         parent_path = item.get("parent")
         if parent_path:
             parent_path = self._strip_fixed_base_directory(parent_path, user_config)
-            return self._normalize_openlist_path(f"{parent_path.rstrip('/')}/{item_name}")
+            resolved = self._normalize_openlist_path(f"{parent_path.rstrip('/')}/{item_name}")
+        else:
+            current_path = self._get_user_navigation_state(user_id).get("current_path", "/")
+            if not isinstance(current_path, str) or not current_path.startswith("/"):
+                current_path = "/"
+            resolved = self._normalize_openlist_path(f"{current_path.rstrip('/')}/{item_name}")
 
-        current_path = self._get_user_navigation_state(user_id).get("current_path", "/")
-        if not isinstance(current_path, str) or not current_path.startswith("/"):
-            current_path = "/"
-        return self._normalize_openlist_path(f"{current_path.rstrip('/')}/{item_name}")
+        nav_state = self._get_user_navigation_state(user_id)
+        submit_root, sender_id = self._submit_context(nav_state)
+        if submit_root:
+            return self._clamp_to_user_submit_dir(resolved, submit_root, sender_id)
+        return resolved
 
     def _format_file_size(self, size: int) -> str:
         """格式化文件大小"""
@@ -636,67 +624,25 @@ class OpenlistPlugin(Star):
         """生成配置命令操作提示。"""
         return self._format_usage_tip(
             title,
-            "ol config <show|setup|set|test|clear_cache>",
+            "素材 配置 <查看|向导|设置|测试|清缓存>",
             [
-                "ol config show",
-                "ol config setup",
-                "ol config set openlist_url http://127.0.0.1:5244",
-                "ol config test",
+                "素材 配置 查看",
+                "素材 配置 向导",
+                "素材 配置 设置 openlist_url http://127.0.0.1:5244",
+                "素材 配置 测试",
             ],
-            "set 用于修改配置项；show 用于查看当前配置。",
-        )
-
-    def _format_backup_usage_tip(self, title: str = "备份指令用法错误") -> str:
-        """生成手动备份命令提示。"""
-        return self._format_usage_tip(
-            title,
-            "ol backup [@群号] [/OpenList目标路径] 或 ol backup retry",
-            [
-                "ol backup",
-                "ol backup /backup/group_123456",
-                "ol backup @123456 /backup/group_123456",
-                "ol backup retry",
-            ],
-            "路径必须以 / 开头，群号必须以 @ 开头；私聊中备份时必须指定 @群号。",
-        )
-
-    def _format_autobackup_usage_tip(self, title: str = "自动备份指令用法错误") -> str:
-        """生成自动备份命令提示。"""
-        return self._format_usage_tip(
-            title,
-            "ol autobackup <show|enable|disable|cancel> [@群号] [/OpenList目标路径]",
-            [
-                "ol autobackup show",
-                "ol autobackup enable",
-                "ol autobackup enable @123456 /backup/group_123456",
-                "ol autobackup disable @123456",
-                "ol autobackup cancel @123456",
-            ],
-            "enable 可指定路径；disable/cancel 不需要路径。私聊中配置时必须指定 @群号。",
-        )
-
-    def _format_restore_usage_tip(self, title: str = "恢复指令用法错误") -> str:
-        """生成恢复命令提示。"""
-        return self._format_usage_tip(
-            title,
-            "ol restore <OpenList来源路径> [@目标群号]",
-            [
-                "ol restore /backup/group_123456",
-                "ol restore /docs @987654",
-                "ol restore /",
-            ],
-            "不指定 @目标群号 时，群聊中恢复到当前群，私聊中以文件消息发送。",
+            "设置 用于修改配置项；查看 用于查看当前配置。",
         )
 
     def _format_upload_usage_tip(self, title: str = "上传指令用法错误") -> str:
         """生成最近附件上传命令提示。"""
         return self._format_usage_tip(
             title,
-            "先发送图片、视频或文件，再在 5 分钟内发送 ol upload [OpenList目标目录]",
+            "先发送图片、视频或文件，再在 5 分钟内发送 素材 上传 [OpenList目标目录]",
             [
-                "ol upload",
-                "ol upload /movies",
-                "ol upload clips",
+                "素材 上传",
+                "素材 上传 /movies",
+                "素材 上传 clips",
             ],
             "只会使用同一会话、同一发送者最近 5 分钟内的最近一条附件消息。",
         )
@@ -709,39 +655,6 @@ class OpenlistPlugin(Star):
     def _unique_suffix(self) -> str:
         """生成临时文件名后缀，避免同一秒内并发请求撞名。"""
         return f"{time.time_ns()}_{uuid.uuid4().hex[:12]}"
-
-    def _render_backup_path(self, path_template: str, group_id) -> str:
-        """渲染备份目录模板，支持 {group_id}、{gid}、{group} 占位符。"""
-        group_id = str(group_id)
-        template = (path_template or "").strip() or f"/backup/group_{group_id}"
-        rendered = (
-            template
-            .replace("{group_id}", group_id)
-            .replace("{gid}", group_id)
-            .replace("{group}", group_id)
-        )
-        return self._normalize_openlist_path(rendered)
-
-    def _get_autobackup_target_path(self, global_cfg: Dict, group_id: str) -> Optional[str]:
-        """从自动备份群配置中解析目标路径。"""
-        group_id = str(group_id)
-        default_path = global_cfg.get("autobackup_default_path", "/backup/group_{group_id}")
-        for item in global_cfg.get("autobackup_groups", []):
-            if not isinstance(item, str):
-                continue
-            item = item.strip()
-            if not item:
-                continue
-            if ":" in item:
-                gid, path = item.split(":", 1)
-                gid = gid.strip()
-                path = path.strip()
-            else:
-                gid = item
-                path = ""
-            if gid == group_id:
-                return self._render_backup_path(path or default_path, group_id)
-        return None
 
     async def _cleanup_temp_file(self, file_path: str, delay: int = 10):
         """延迟清理已发送的临时文件。"""
@@ -871,178 +784,186 @@ class OpenlistPlugin(Star):
             result += f" | 📊 总计: {dirs_count} 个文件夹, {files_only_count} 个文件"
 
         result += f"\n\n💡 快速导航:"
-        result += f"\n\n   • ol ls 序号 - 进入目录/获取链接"
-        result += f"\n\n   • ol download 序号 - 下载并发送文件"
+        result += f"\n\n   • 素材 列表 序号 - 进入目录/获取链接"
+        result += f"\n\n   • 素材 下载 序号 - 下载并发送文件"
         if not is_search_result:
-             result += f"\n\n   • ol quit - 返回上级目录"
+             result += f"\n\n   • 素材 上一级 - 返回上级目录"
         if total_pages > 1:
-            result += f"\n   • ol prev - ⬅️ 上一页"
-            result += f"\n   • ol next - ➡️ 下一页"
+            result += f"\n   • 素材 上一页 - ⬅️ 上一页"
+            result += f"\n   • 素材 下一页 - ➡️ 下一页"
         return result
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=3)
     async def remember_recent_upload_message(self, event: AstrMessageEvent):
-        """记录最近附件消息，供 ol upload 使用。"""
+        """记录最近附件消息，供 素材 上传 使用。"""
         await self.upload_service.remember_uploadable_message(event)
-
-    @filter.event_message_type(filter.EventMessageType.ALL, priority=2)
-    async def handle_group_file_upload(self, event: AstrMessageEvent):
-        """处理群文件上传事件（自动备份）"""
-        return await self.backup_service.handle_group_file_upload(event)
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=100000)
     async def handle_openlist_root_help(self, event: AstrMessageEvent):
-        """拦截 ol 根指令，避免展示框架生成的参数树。"""
+        """拦截 素材 根指令，避免展示框架生成的参数树。"""
         message = self._strip_wake_prefix((event.message_str or "").strip())
-        if message not in ("ol", "网盘"):
+        if message not in ("素材",):
             return
         event.stop_event()
         async for result in self.help_service.help_command(event):
             yield result
 
-    @filter.command_group("ol", alias=["网盘"])
+    @filter.command_group("素材")
     def openlist_group(self):
         """Openlist文件管理命令组"""
         pass
 
-    @openlist_group.command("config", alias=["配置"])
-    async def config_command(self, event: AstrMessageEvent, action: str = "show", key: str = "", value: str = ""):
+    @openlist_group.command("配置", alias=["设置"])
+    async def config_command(self, event: AstrMessageEvent, action: str = "查看", key: str = "", value: str = ""):
         """配置连接与插件参数。
         示例：
-          ol config show
-          ol config set openlist_url http://127.0.0.1:5244
+          素材 配置
+          素材 配置 设置 openlist_url http://127.0.0.1:5244
         """
         async for result in self.config_command_service.config_command(event, action, key, value):
             yield result
 
-    @openlist_group.command("ls", alias=["列表", "直链"])
+    @openlist_group.command("列表", alias=["直链"])
     async def list_files(self, event: AstrMessageEvent, path: str = ""):
         """列出目录或获取文件链接。
         示例：
-          ol ls /movies
-          ol ls 2
+          素材 列表 /movies
+          素材 列表 2
         """
         async for result in self.browse_service.list_files(event, path):
             yield result
 
-    @openlist_group.command("next", alias=["下一页"])
+    @openlist_group.command("下一页")
     async def next_page(self, event: AstrMessageEvent):
-        """查看当前列表下一页。示例：ol next"""
+        """查看当前列表下一页。示例：素材 下一页"""
         async for result in self.browse_service.next_page(event):
             yield result
 
-    @openlist_group.command("prev", alias=["上一页"])
+    @openlist_group.command("上一页")
     async def prev_page(self, event: AstrMessageEvent):
-        """查看当前列表上一页。示例：ol prev"""
+        """查看当前列表上一页。示例：素材 上一页"""
         async for result in self.browse_service.prev_page(event):
             yield result
 
-    @openlist_group.command("search", alias=["搜索"])
-    async def search_files(self, event: AstrMessageEvent, keyword: str = "", path: str = "/"):
+    @openlist_group.command("搜索")
+    async def search_command(self, event: AstrMessageEvent, keyword: str = "", path: str = ""):
         """搜索文件。
         示例：
-          ol search 年度报告
-          ol search 年度报告 /docs
+          素材 搜索 年度报告
+          素材 搜索 年度报告 /documents
         """
+        denied = self._submit_deny_if_applicable(event)
+        if denied is not None:
+            yield denied
+            return
         async for result in self.browse_service.search_files(event, keyword, path):
             yield result
 
-    @openlist_group.command("info", alias=["信息"])
+    @openlist_group.command("信息")
     async def file_info(self, event: AstrMessageEvent, path: str = ""):
-        """查看文件或目录信息。示例：ol info /docs/report.pdf"""
+        """查看文件或目录信息。示例：素材 信息 /docs/report.pdf"""
         async for result in self.browse_service.file_info(event, path):
             yield result
 
-    @openlist_group.command("download", alias=["下载"])
+    @openlist_group.command("下载")
     async def get_download_link(self, event: AstrMessageEvent, path: str = ""):
         """下载并发送文件。
         示例：
-          ol download 3
-          ol download /docs/report.pdf
+          素材 下载 3
+          素材 下载 /docs/report.pdf
         """
         async for result in self.browse_service.get_download_link(event, path):
             yield result
 
-    @openlist_group.command("quit", alias=["上一级", "返回"])
+    @openlist_group.command("上一级", alias=["返回"])
     async def quit_navigation(self, event: AstrMessageEvent):
-        """返回上级目录。示例：ol quit"""
+        """返回上级目录。示例：素材 上一级"""
         async for result in self.browse_service.quit_navigation(event):
             yield result
 
-    @openlist_group.command("upload", alias=["上传"])
+    @openlist_group.command("上传")
     async def upload_command(self, event: AstrMessageEvent, target: str = ""):
         """上传最近附件消息。
+
         示例：
           先发送图片、视频或文件
-          ol upload /movies
+          素材 上传 /movies
+          素材 上传 周日整理的资料
         """
+        # 合并 AstrBot 解析的首个参数与指令后的完整文字，支持多词自定义说明
+        target = (target or "").strip()
+        raw_text = self._strip_upload_command_prefix(event)
+        if raw_text:
+            target = raw_text
         async for result in self.upload_service.upload_command(event, target):
             yield result
 
-    @openlist_group.command("backup", alias=["备份"])
-    async def backup_command(self, event: AstrMessageEvent, path: str = "", group: str = ""):
-        """备份群文件。
-        示例：
-          ol backup
-          ol backup @123456 /backup/group_123456
-        """
-        async for result in self.backup_service.backup_command(event, path, group):
-            yield result
+    def _strip_upload_command_prefix(self, event: AstrMessageEvent) -> str:
+        """从事件消息中剥离 '素材 上传' 前缀，返回后面的完整正文。
 
-    @openlist_group.command("autobackup", alias="自动备份")
-    async def autobackup_command(self, event: AstrMessageEvent, action: str = "show", target: str = "", path: str = ""):
-        """配置自动备份。
-        示例：
-          ol autobackup show
-          ol autobackup enable @123456 /backup
-          ol autobackup cancel @123456
+        例如：
+          素材 上传 /movies        -> "/movies"
+          素材 上传 周日整理资料     -> "周日整理资料"
+          素材 上传                 -> ""
         """
-        async for result in self.backup_service.autobackup_command(event, action, target, path):
-            yield result
+        message = self._strip_wake_prefix((event.message_str or "").strip())
+        # 先剥离命令组关键词 素材
+        group_word = "素材"
+        lowered = message.lower()
+        if lowered == group_word.lower():
+            message = ""
+        elif lowered.startswith(group_word.lower() + " "):
+            message = message[len(group_word):].strip()
+        # 再剥离子命令 上传
+        for head in ("上传",):
+            lowered = message.lower()
+            if lowered == head.lower():
+                return ""
+            if lowered.startswith(head.lower() + " "):
+                return message[len(head):].strip()
+        return ""
 
-    @openlist_group.command("restore", alias=["恢复"])
-    async def restore_command(self, event: AstrMessageEvent, path: str = "", target: str = ""):
-        """恢复网盘文件到群或私聊。
-        示例：
-          ol restore /backup/group_123456
-          ol restore /docs @987654
-        """
-        async for result in self.restore_service.restore_command(event, path, target):
-            yield result
-
-    @openlist_group.command("preview", alias=["预览"])
+    @openlist_group.command("预览")
     async def preview_command(self, event: AstrMessageEvent, path: str = ""):
         """预览文本或压缩包。
         示例：
-          ol preview 1
-          ol preview /data/config.txt
+          素材 预览 1
+          素材 预览 /data/config.txt
         """
         async for result in self.preview_service.preview_command(event, path):
             yield result
 
-    @openlist_group.command("rm", alias=["删除"])
+    @openlist_group.command("删除")
     async def remove_command(self, event: AstrMessageEvent, path: str = ""):
         """删除文件或文件夹。
         示例：
-          ol rm 4
-          ol rm /tmp/stale.txt
+          素材 删除 4
+          素材 删除 /tmp/stale.txt
         """
+        denied = self._submit_deny_if_applicable(event)
+        if denied is not None:
+            yield denied
+            return
         async for result in self.browse_service.remove_command(event, path):
             yield result
 
-    @openlist_group.command("mkdir", alias=["新建"])
+    @openlist_group.command("新建")
     async def mkdir_command(self, event: AstrMessageEvent, name: str = ""):
         """创建文件夹。
         示例：
-          ol mkdir new_folder
-          ol mkdir /data/new_dir
+          素材 新建 new_folder
+          素材 新建 /data/new_dir
         """
+        denied = self._submit_deny_if_applicable(event)
+        if denied is not None:
+            yield denied
+            return
         async for result in self.browse_service.mkdir_command(event, name):
             yield result
 
-    @openlist_group.command("help", alias=["帮助"])
+    @openlist_group.command("帮助")
     async def help_command(self, event: AstrMessageEvent):
-        """显示完整帮助。示例：ol help"""
+        """显示完整帮助。示例：素材 帮助"""
         async for result in self.help_service.help_command(event):
             yield result
 

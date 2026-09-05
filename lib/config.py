@@ -17,16 +17,11 @@ USER_SETTABLE_CONFIG_KEYS = [
     "upload_chunk_size_mb", "upload_progress_step_mb", "upstream_connect_timeout",
     "upstream_read_timeout", "openlist_connect_timeout", "openlist_upload_response_timeout",
     "debug_transfer_logging", "debug_upload_logging",
-    "backup_default_path", "backup_allowed_extensions", "backup_max_size", "backup_skip_existing",
-    "backup_retry_attempts", "backup_retry_delay",
 ]
 
 INTEGER_CONFIG_RULES = {
     "max_display_files": (1, 100, "max_display_files 必须在1-100之间"),
     "cache_duration": (1, None, "cache_duration 必须大于0"),
-    "backup_max_size": (0, None, "backup_max_size 必须大于等于0"),
-    "backup_retry_attempts": (1, None, "backup_retry_attempts 必须大于0"),
-    "backup_retry_delay": (0, None, "backup_retry_delay 必须大于等于0"),
     "max_download_size": (0, None, "max_download_size 必须大于等于0"),
     "max_upload_size": (0, None, "max_upload_size 必须大于等于0"),
     "upload_retry_attempts": (1, None, "upload_retry_attempts 必须大于0"),
@@ -44,16 +39,13 @@ INTEGER_CONFIG_RULES = {
 BOOLEAN_CONFIG_KEYS = {
     "enable_cache",
     "debug_transfer_logging",
-    "backup_skip_existing",
 }
 
 EXTENSION_CONFIG_KEYS = {
     "allowed_extensions",
-    "backup_allowed_extensions",
 }
 
 CLEAR_EXTENSION_VALUES = {"none", "null", "empty", "clear", "all", "*", "空", "不限", "不限制"}
-AUTOBACKUP_GROUPS_WEBUI_MIGRATION_KEY = "_autobackup_groups_webui_migrated"
 
 WEBUI_CONFIG_MAPPING = {
     "default_openlist_url": "openlist_url",
@@ -79,14 +71,8 @@ WEBUI_CONFIG_MAPPING = {
     "openlist_connect_timeout": "openlist_connect_timeout",
     "openlist_upload_response_timeout": "openlist_upload_response_timeout",
     "debug_transfer_logging": "debug_transfer_logging",
-    "backup_default_path": "backup_default_path",
-    "autobackup_default_path": "autobackup_default_path",
+    "default_submit_path": "default_submit_path",
     "require_user_auth": "require_user_auth",
-    "backup_allowed_extensions": "backup_allowed_extensions",
-    "backup_max_size": "backup_max_size",
-    "backup_skip_existing": "backup_skip_existing",
-    "backup_retry_attempts": "backup_retry_attempts",
-    "backup_retry_delay": "backup_retry_delay",
 }
 
 GLOBAL_LEGACY_CONFIG_KEYS = {
@@ -131,12 +117,7 @@ class UserConfigManager:
             "openlist_connect_timeout": 30,
             "openlist_upload_response_timeout": 3000,
             "debug_transfer_logging": False,
-            "backup_default_path": "/backup/group_{group_id}",
-            "backup_allowed_extensions": "",
-            "backup_max_size": 0,
-            "backup_skip_existing": True,
-            "backup_retry_attempts": 3,
-            "backup_retry_delay": 5,
+            "default_submit_path": "",
             "setup_completed": False,
         }
 
@@ -200,14 +181,7 @@ class GlobalConfigManager:
             "openlist_connect_timeout": 30,
             "openlist_upload_response_timeout": 3000,
             "debug_transfer_logging": False,
-            "backup_default_path": "/backup/group_{group_id}",
-            "autobackup_default_path": "/backup/group_{group_id}",
-            "autobackup_groups": [], # 由 ol autobackup 指令维护的自动备份群号列表
-            "backup_allowed_extensions": "",
-            "backup_max_size": 0,
-            "backup_skip_existing": True,
-            "backup_retry_attempts": 3,
-            "backup_retry_delay": 5,
+            "default_submit_path": "",
         }
 
     def load_config(self) -> Dict:

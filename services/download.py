@@ -35,7 +35,7 @@ class DownloadService(PluginService):
             size_mb = file_size / (1024 * 1024)
             yield event.plain_result(
                 f"❌ 文件过大：{size_mb:.1f}MB > {max_download_size_mb}MB\n"
-                "请使用 ol ls 获取下载链接。"
+                "请使用 素材 列表 获取下载链接。"
             )
             return
         try:
@@ -49,8 +49,8 @@ class DownloadService(PluginService):
                 if not link:
                     yield event.plain_result(
                         "❌ 无法获取真实下载链接。\n"
-                        "用法：ol config set token <OpenList令牌>\n"
-                        "示例：ol config test\n"
+                        "用法：素材 配置 设置 token <OpenList令牌>\n"
+                        "示例：素材 配置 测试\n"
                         "提示：请确认配置账号为 OpenList 管理员，或具有 /api/fs/link 权限。"
                     )
                     return
@@ -67,7 +67,7 @@ class DownloadService(PluginService):
                     size_mb = link_size / (1024 * 1024)
                     yield event.plain_result(
                         f"❌ 文件过大：{size_mb:.1f}MB > {max_download_size_mb}MB\n"
-                        "请使用 ol ls 获取下载链接。"
+                        "请使用 素材 列表 获取下载链接。"
                     )
                     return
                 temp_file_path = self._make_temp_file_path("downloads", str(user_id), file_name)
@@ -89,7 +89,7 @@ class DownloadService(PluginService):
                                         size_mb = downloaded / (1024 * 1024)
                                         yield event.plain_result(
                                             f"❌ 文件过大：{size_mb:.1f}MB > {max_download_size_mb}MB\n"
-                                            "请使用 ol ls 获取下载链接。"
+                                            "请使用 素材 列表 获取下载链接。"
                                         )
                                         return
                                     if (
