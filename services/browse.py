@@ -1,4 +1,5 @@
 import posixpath
+from typing import Optional
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
@@ -8,6 +9,22 @@ from .base import PluginService
 
 class BrowseService(PluginService):
     """Browse service."""
+
+    def _mutate_scope_deny(self, user_id: str, full_path: str, submit_root: str) -> Optional[str]:
+        """投稿模式下，非白名单用户仅允许操作自己个人文件夹内的对象。
+
+        full_path 为解析出的绝对路径；若越权返回拒绝文案，否则返回 None。
+        白名单用户（干事/干部）不受限制。
+        """
+        if self.is_whitelisted_user(user_id):
+            return None
+        anchor = self.get_user_submit_dir(submit_root, user_id)
+        alist = anchor.rstrip("/")
+        p = self._normalize_openlist_path(full_path)
+        # 允许操作对象位于个人文件夹内（含本人文件夹本身之下），但不允许本人文件夹本身/上级
+        if p.startswith(alist + "/"):
+            return None
+        return "🔒 投稿模式下，非白名单用户只能修改自己个人文件夹内的文件。如需管理他人文件夹请联系管理员。"
 
     async def list_files(self, event: AstrMessageEvent, path: str = ""):
         """列出文件和目录，或获取文件链接"""
@@ -457,6 +474,14 @@ class BrowseService(PluginService):
             target_names = [posixpath.basename(full_path)]
             display_name = full_path
 
+        # 投稿模式下：非白名单用户仅允许删除自己个人文件夹内的对象
+        submit_root = self.get_submit_root(user_config)
+        if submit_root:
+            deny = self._mutate_scope_deny(user_id, full_path, submit_root)
+            if deny:
+                yield event.plain_result(deny)
+                return
+
         try:
             async with self._create_openlist_client(user_config) as client:
                 success = await client.remove(target_dir, target_names)
@@ -536,6 +561,14 @@ class BrowseService(PluginService):
         if full_path == "/":
             yield event.plain_result("❌ 不允许创建根目录。")
             return
+
+        # 投稿模式下：非白名单用户仅允许在自己个人文件夹内创建
+        submit_root = self.get_submit_root(user_config)
+        if submit_root:
+            deny = self._mutate_scope_deny(user_id, full_path, submit_root)
+            if deny:
+                yield event.plain_result(deny)
+                return
 
         try:
             async with self._create_openlist_client(user_config) as client:

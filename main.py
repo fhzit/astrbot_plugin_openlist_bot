@@ -1096,14 +1096,7 @@ class OpenlistPlugin(Star):
           素材 删除 /tmp/stale.txt
         """
         user_id = event.get_sender_id()
-        # 投稿模式下：仅白名单用户可删除
-        try:
-            user_config = self.get_user_config(user_id)
-        except Exception:
-            user_config = {}
-        if self.is_submit_mode(user_config) and not self.is_whitelisted_user(user_id):
-            yield event.plain_result("🔒 投稿模式下仅白名单用户可执行删除操作。")
-            return
+        # 投稿模式下：非白名单用户仅允许删除自己个人文件夹内的文件（作用域检查在服务层执行）
         async for result in self.browse_service.remove_command(event, path):
             yield result
 
@@ -1114,10 +1107,6 @@ class OpenlistPlugin(Star):
           素材 新建 new_folder
           素材 新建 /data/new_dir
         """
-        denied = self._submit_deny_if_applicable(event)
-        if denied is not None:
-            yield event.plain_result(denied)
-            return
         async for result in self.browse_service.mkdir_command(event, name):
             yield result
 
