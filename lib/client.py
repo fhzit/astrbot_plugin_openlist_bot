@@ -745,3 +745,145 @@ class OpenlistClient:
         if result and result.get("code") == 200:
             return result.get("data")
         return None
+
+    # ------------------------------------------------------------------
+    # 管理员账户管理（需 admin token / 管理员权限）
+    # 端点（OpenList 源码 server/router.go + server/handles/user.go 确认）：
+    #   POST /api/admin/user/create   CreateUser
+    #   GET  /api/admin/user/list     ListUsers  (query: page, per_page)
+    #   POST /api/admin/user/update   UpdateUser (全量 body，含 id)
+    #   POST /api/admin/user/delete   DeleteUser (query: id)
+    # 权限位（internal/model/user.go）：
+    #   bit1 writeContent(mkdir/upload)  8
+    #   bit2 rename 16, bit3 move 32, bit4 copy 64, bit5 remove 128
+    #   role: GENERAL=0, GUEST=1, ADMIN=2
+    # ------------------------------------------------------------------
+
+    # 写内容+重命名+移动+复制+删除 = 8|16|32|64|128 = 248
+    SUBMIT_ACCOUNT_PERMISSION = 8 | 16 | 32 | 64 | 128
+    GENERAL_ROLE = 0
+
+    async def create_user(
+        self,
+        username: str,
+        password: str,
+        base_path: str = "/",
+        permission: int = SUBMIT_ACCOUNT_PERMISSION,
+    ) -> Optional[Dict]:
+        """创建普通用户（POST /api/admin/user/create）。成功返回服务器响应 dict。"""
+        payload = {
+            "username": username,
+            "password": password,
+            "base_path": base_path,
+            "role": self.GENERAL_ROLE,
+            "permission": permission,
+            "disabled": False,
+            "sso_id": "",
+        }
+        result = await self._post_api_result(
+            "/api/admin/user/create",
+            payload,
+            "创建OpenList用户",
+            f", 用户名: {username}, base_path: {base_path}",
+        )
+        if result and result.get("code") == 200:
+            return result
+        logger.error(f"创建OpenList用户失败 - 用户名: {username}")
+        return None
+
+    async def list_users(self, page: int = 1, per_page: int = 100) -> Optional[List[Dict]]:
+        """列出用户（GET /api/admin/user/list）。成功返回 data.content 列表。"""
+        try:
+            async with self.session.get(
+                f"{self.base_url}/api/admin/user/list",
+                params={"page": page, "per_page": per_page},
+                headers=self._auth_headers(),
+            ) as resp:
+                if resp.status == 200:
+                    result = await resp.json()
+                    if result.get("code") == 200:
+                        content = result.get("data", {}).get("content")
+                        return content if content is not None else []
+                    logger.error(
+                        f"列出OpenList用户失败 - code: {result.get('code')}, message: {result.get('message', '未知错误')}"
+                    )
+                    return None
+                error_text = await resp.text()
+                logger.error(f"列出OpenList用户失败 - HTTP状态: {resp.status}, 响应: {error_text}")
+                return None
+        except Exception as e:
+            logger.error(f"列出OpenList用户失败: {e}", exc_info=True)
+            return None
+
+    async def find_user_by_username(self, username: str) -> Optional[Dict]:
+        """按用户名查找用户（遍历 admin user list）。找不到返回 None。"""
+        page = 1
+        per_page = 100
+        while True:
+            users = await self.list_users(page=page, per_page=per_page)
+            if users is None:
+                return None
+            for u in users:
+                if u.get("username") == username:
+                    return u
+            if len(users) < per_page:
+                break
+            page += 1
+        return None
+
+    async def update_user(
+        self,
+        user_id,
+        username: str,
+        base_path: str = "/",
+        password: str = "",
+        permission: int = SUBMIT_ACCOUNT_PERMISSION,
+        disabled: bool = False,
+        role: int = GENERAL_ROLE,
+    ) -> bool:
+        """更新用户信息（POST /api/admin/user/update）。password 非空则重置密码。"""
+        payload = {
+            "id": int(user_id),
+            "username": username,
+            "base_path": base_path,
+            "role": role,
+            "permission": permission,
+            "disabled": disabled,
+            "sso_id": "",
+        }
+        if password:
+            payload["password"] = password
+        result = await self._post_api_result(
+            "/api/admin/user/update",
+            payload,
+            "更新OpenList用户",
+            f", 用户名: {username}",
+        )
+        if result and result.get("code") == 200:
+            return True
+        logger.error(f"更新OpenList用户失败 - 用户名: {username}")
+        return False
+
+    async def delete_user(self, user_id) -> bool:
+        """删除用户（POST /api/admin/user/delete?id=<id>）。"""
+        try:
+            async with self.session.post(
+                f"{self.base_url}/api/admin/user/delete",
+                params={"id": user_id},
+                headers=self._auth_headers(),
+            ) as resp:
+                if resp.status == 200:
+                    result = await resp.json()
+                    if result.get("code") == 200:
+                        return True
+                    logger.error(
+                        f"删除OpenList用户失败 - code: {result.get('code')}, "
+                        f"message: {result.get('message', '未知错误')}"
+                    )
+                    return False
+                error_text = await resp.text()
+                logger.error(f"删除OpenList用户失败 - HTTP状态: {resp.status}, 响应: {error_text}")
+                return False
+        except Exception as e:
+            logger.error(f"删除OpenList用户失败: {e}", exc_info=True)
+            return False

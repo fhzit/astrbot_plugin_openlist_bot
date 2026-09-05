@@ -2,6 +2,8 @@ import asyncio
 import json
 import os
 import posixpath
+import secrets
+import string
 import time
 import uuid
 from typing import List, Dict, Optional
@@ -20,6 +22,7 @@ from .lib.config import (
 )
 from .lib.cache import CacheManager
 from .services import BrowseService, ConfigCommandService, DownloadService, HelpService, PreviewService, UploadService
+from .services.account_service import AccountService
 
 
 class OpenlistPlugin(Star):
@@ -41,6 +44,7 @@ class OpenlistPlugin(Star):
         self.config_command_service = ConfigCommandService(self)
         self.preview_service = PreviewService(self)
         self.help_service = HelpService(self)
+        self.account_service = AccountService(self)
 
     def get_webui_config(self, key: str, default=None):
         """获取WebUI配置项"""
@@ -920,13 +924,44 @@ class OpenlistPlugin(Star):
         async for result in self.browse_service.file_info(event, path):
             yield result
 
+    @openlist_group.command("重置密码")
+    async def reset_password_command(self, event: AstrMessageEvent):
+        """重置本人 OpenList 账户密码并展示新密码。
+
+        示例：素材 重置密码
+        """
+        user_id = event.get_sender_id()
+        # 非白名单用户无响应
+        if not self.is_whitelisted_user(user_id):
+            return
+        qq = str(user_id).strip()
+        acct = await self.account_service.reset_password(qq)
+        if not acct.get("ok"):
+            yield event.plain_result(acct.get("message"))
+            return
+        base_path = acct.get("base_path")
+        text = (
+            f"{acct.get('message')}\n"
+            f"🔑 OpenList 账户：\n"
+            f"  地址：{self._get_public_site_url()}\n"
+            f"  用户名：{acct.get('username')}\n"
+            f"  新密码：`{acct.get('password')}`\n"
+        )
+        if base_path and base_path != "/":
+            text += f"  基础路径：{base_path}\n"
+        text += "💡 请妥善保管新密码，可随时再次重置。"
+        yield event.plain_result(text)
+
     @openlist_group.command("网站")
     async def website_command(self, event: AstrMessageEvent):
-        """跳转云盘网站。显示 OpenList 云盘访问地址（优先对外地址）。
+        """跳转云盘网站。显示 OpenList 云盘地址（优先对外地址）与账户用户名。
 
         示例：素材 网站
         """
         user_id = event.get_sender_id()
+        # 非白名单用户无响应
+        if not self.is_whitelisted_user(user_id):
+            return
         user_config = self.get_user_config(user_id)
         site_url = (user_config.get("public_openlist_url") or "").strip()
         if not site_url:
@@ -934,10 +969,20 @@ class OpenlistPlugin(Star):
         if not site_url:
             yield event.plain_result("❓ 尚未配置云盘网站地址。\n💡 管理员可在后台插件配置中填写 openlist_url / public_openlist_url。")
             return
+        username = str(user_id).strip()
         yield event.plain_result(
             f"☁️ 云盘网站：\n{site_url}\n\n"
+            f"👤 用户名：{username}\n\n"
             f"💡 点击上方链接即可跳转打开云盘。"
         )
+
+    def _get_public_site_url(self) -> str:
+        """获取向用户展示用的 OpenList 访问地址（优先对外地址）。"""
+        try:
+            user_config = self.get_global_config()
+        except Exception:
+            return ""
+        return (user_config.get("public_openlist_url") or user_config.get("openlist_url") or "").strip()
 
     @openlist_group.command("下载")
     async def get_download_link(self, event: AstrMessageEvent, path: str = ""):
@@ -1099,16 +1144,37 @@ class OpenlistPlugin(Star):
             if existed:
                 yield event.plain_result(f"ℹ️ QQ {qq} 已在普通白名单中，无需重复添加。")
                 return
+            # 先建 OpenList 账户，成功后再写入白名单，避免建号失败却进入白名单
+            acct = await self.account_service.create_account(qq)
+            if not acct.get("ok"):
+                yield event.plain_result(f"{acct.get('message')}\n❌ 白名单未变更，请解决 OpenList 账户问题后重试。")
+                return
             normal.append(qq)
             self._set_submit_whitelist_normal(normal)
-            yield event.plain_result(f"✅ 已将 QQ {qq} 加入普通白名单。\n📋 当前普通白名单: {self._format_q_list(normal)}")
+            base_path = acct.get("base_path")
+            resp = (
+                f"✅ 已将 QQ {qq} 加入普通白名单。\n"
+                f"🔑 OpenList 账户：\n"
+                f"  地址：{self._get_public_site_url()}\n"
+                f"  用户名：{acct.get('username')}\n"
+                f"  密码：`{acct.get('password')}`\n"
+            )
+            if base_path and base_path != "/":
+                resp += f"  基础路径：{base_path}\n"
+            resp += f"📋 当前普通白名单: {self._format_q_list(normal)}"
+            yield event.plain_result(resp)
         else:
             if not existed:
                 yield event.plain_result(f"ℹ️ QQ {qq} 不在普通白名单中，无需删除。")
                 return
+            # 先删除 OpenList 账户（失败则中止，保留白名单），成功后再移除白名单
+            acct = await self.account_service.delete_account(qq)
+            if not acct.get("ok"):
+                yield event.plain_result(f"{acct.get('message')}\n❌ 白名单未变更。")
+                return
             normal.remove(qq)
             self._set_submit_whitelist_normal(normal)
-            yield event.plain_result(f"✅ 已从普通白名单移除 QQ {qq}。\n📋 当前普通白名单: {self._format_q_list(normal)}")
+            yield event.plain_result(f"{acct.get('message')}\n📋 当前普通白名单: {self._format_q_list(normal)}")
 
     def _split_whitelist_action(self, raw: str):
         """从形如 “增加10001”/“删除10001” 中拆出动作与 QQ；否则原样返回。"""
