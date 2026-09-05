@@ -920,6 +920,25 @@ class OpenlistPlugin(Star):
         async for result in self.browse_service.file_info(event, path):
             yield result
 
+    @openlist_group.command("网站")
+    async def website_command(self, event: AstrMessageEvent):
+        """跳转云盘网站。显示 OpenList 云盘访问地址（优先对外地址）。
+
+        示例：素材 网站
+        """
+        user_id = event.get_sender_id()
+        user_config = self.get_user_config(user_id)
+        site_url = (user_config.get("public_openlist_url") or "").strip()
+        if not site_url:
+            site_url = (user_config.get("openlist_url") or "").strip()
+        if not site_url:
+            yield "❓ 尚未配置云盘网站地址。\n💡 管理员可在后台插件配置中填写 openlist_url / public_openlist_url。"
+            return
+        yield (
+            f"☁️ 云盘网站：\n{site_url}\n\n"
+            f"💡 点击上方链接即可跳转打开云盘。"
+        )
+
     @openlist_group.command("下载")
     async def get_download_link(self, event: AstrMessageEvent, path: str = ""):
         """下载并发送文件。
