@@ -955,6 +955,13 @@ class OpenlistPlugin(Star):
             logger.warning(f"好友添加通知解析失败，跳过: {e}")
             return
         try:
+            # WebUI 开关：关闭则不自动发送
+            if not self._get_bool_config(self.get_global_config(), "friend_add_welcome_enabled", True):
+                logger.info("[friend_add] 已关闭自动发送素材帮助（friend_add_welcome_enabled=false），跳过。")
+                return
+        except Exception as e:
+            logger.warning(f"[friend_add] 读取自动帮助开关失败，默认启用: {e}")
+        try:
             from astrbot.api.event import MessageChain
             chain = MessageChain().message(self.help_service.build_help_text("普通用户"))
             origin = event.unified_msg_origin or ""

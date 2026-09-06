@@ -39,6 +39,7 @@ INTEGER_CONFIG_RULES = {
 BOOLEAN_CONFIG_KEYS = {
     "enable_cache",
     "debug_transfer_logging",
+    "friend_add_welcome_enabled",
 }
 
 EXTENSION_CONFIG_KEYS = {
@@ -74,6 +75,7 @@ WEBUI_CONFIG_MAPPING = {
     "default_submit_path": "default_submit_path",
     "submit_whitelist": "submit_whitelist",
     "require_user_auth": "require_user_auth",
+    "friend_add_welcome_enabled": "friend_add_welcome_enabled",
 }
 
 GLOBAL_LEGACY_CONFIG_KEYS = {
@@ -185,6 +187,7 @@ class GlobalConfigManager:
             "default_submit_path": "",
             "submit_whitelist": "",
             "submit_whitelist_normal": "",
+            "friend_add_welcome_enabled": True,
         }
 
     def load_config(self) -> Dict:

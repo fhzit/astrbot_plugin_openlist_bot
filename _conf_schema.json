@@ -154,6 +154,12 @@
                 "default": false,
                 "hint": "开启后输出上传/下载进度、连接信息和 DNS 解析等详细日志。"
             },
+            "friend_add_welcome_enabled": {
+                "description": "添加好友后自动发送素材帮助",
+                "type": "bool",
+                "default": true,
+                "hint": "开启后，当新用户添加机器人为好友(friend_add 通知)时，自动向该用户发送一份 素材 帮助。关闭则不发送。"
+            },
             "require_user_auth": {
                 "description": "要求用户认证",
                 "type": "bool",
