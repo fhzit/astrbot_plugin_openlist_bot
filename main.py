@@ -941,6 +941,31 @@ class OpenlistPlugin(Star):
         async for result in self.help_service.help_command(event):
             yield result
 
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=4)
+    async def handle_friend_add_welcome(self, event: AstrMessageEvent):
+        """当用户添加机器人为好友(friend_add 通知)时，自动发送 素材 帮助。"""
+        try:
+            msg_obj = event.message_obj
+            raw = getattr(msg_obj, "raw_message", None)
+            if not isinstance(raw, dict):
+                return
+            if raw.get("post_type") != "notice" or raw.get("notice_type") != "friend_add":
+                return
+        except Exception as e:
+            logger.warning(f"好友添加通知解析失败，跳过: {e}")
+            return
+        try:
+            from astrbot.api.event import MessageChain
+            chain = MessageChain().message(self.help_service.build_help_text("普通用户"))
+            origin = event.unified_msg_origin or ""
+            if not origin:
+                logger.warning("好友添加通知缺少 unified_msg_origin，无法主动发送帮助。")
+                return
+            logger.info(f"[friend_add] 用户 {event.get_sender_id()} 添加好友，自动发送素材帮助。")
+            await self.context.send_message(origin, chain)
+        except Exception as e:
+            logger.error(f"[friend_add] 自动发送素材帮助失败: {e}", exc_info=True)
+
     @filter.command_group("素材")
     def openlist_group(self):
         """Openlist文件管理命令组"""
