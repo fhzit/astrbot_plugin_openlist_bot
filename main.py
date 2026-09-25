@@ -237,11 +237,21 @@ class OpenlistPlugin(Star):
             return f"group:{group_id}:user:{user_id}"
         return f"private:user:{user_id}"
 
+    def _get_onebot_api(self, event: AstrMessageEvent):
+        """获取 OneBot 风格的 bot API；QQ 官方机器人等平台没有 call_action，返回 None。"""
+        api = getattr(getattr(event, "bot", None), "api", None)
+        if api is None or not callable(getattr(api, "call_action", None)):
+            return None
+        return api
+
     async def _get_group_member_role(self, event: AstrMessageEvent, group_id, user_id=None):
         """通过 OneBot 查询指定用户在目标群的角色。"""
         user_id = user_id or event.get_sender_id()
+        api = self._get_onebot_api(event)
+        if api is None:
+            return None
         try:
-            member_info = await event.bot.api.call_action(
+            member_info = await api.call_action(
                 "get_group_member_info",
                 group_id=int(group_id),
                 user_id=int(user_id),

@@ -40,6 +40,7 @@ BOOLEAN_CONFIG_KEYS = {
     "enable_cache",
     "debug_transfer_logging",
     "friend_add_welcome_enabled",
+    "group_file_auto_upload",
 }
 
 EXTENSION_CONFIG_KEYS = {
@@ -76,6 +77,8 @@ WEBUI_CONFIG_MAPPING = {
     "submit_whitelist": "submit_whitelist",
     "require_user_auth": "require_user_auth",
     "friend_add_welcome_enabled": "friend_add_welcome_enabled",
+    "group_file_auto_upload": "group_file_auto_upload",
+    "group_file_upload_path": "group_file_upload_path",
 }
 
 GLOBAL_LEGACY_CONFIG_KEYS = {
@@ -188,6 +191,8 @@ class GlobalConfigManager:
             "submit_whitelist": "",
             "submit_whitelist_normal": "",
             "friend_add_welcome_enabled": True,
+            "group_file_auto_upload": False,
+            "group_file_upload_path": "",
         }
 
     def load_config(self) -> Dict:

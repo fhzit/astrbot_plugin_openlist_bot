@@ -23,10 +23,15 @@ class UploadService(PluginService):
     UPLOAD_SEGMENT_TYPES = {"file", "image", "video"}
     RECENT_UPLOAD_TTL_SECONDS = 300
     MAX_RECENT_UPLOAD_MESSAGES = 500
+    # AstrBot 消息组件类型 -> 可上传 segment 类型（QQ 官方机器人等平台 raw_message 不是 dict）
+    COMPONENT_TYPE_TO_SEGMENT = {"Image": "image", "Video": "video", "File": "file"}
+    GROUP_AUTO_UPLOAD_DEDUPE_TTL_SECONDS = 1800
 
     def __init__(self, plugin):
         super().__init__(plugin)
         self._submit_name_cursor = {}
+        self._auto_upload_tasks = set()
+        self._group_auto_upload_seen = {}
 
     async def _upload_file_with_retry(
         self,
@@ -128,6 +133,49 @@ class UploadService(PluginService):
         segments = self._normalize_message_segments(message)
         return [segment for segment in segments if segment.get("type") in self.UPLOAD_SEGMENT_TYPES]
 
+    def _extract_upload_components(self, event: AstrMessageEvent) -> List[Dict]:
+        """从 AstrBot 消息组件中提取可上传附件（QQ 官方机器人等平台的 raw_message 不是 OneBot dict）。
+
+        返回与 _normalize_message_segments 相同结构的 segment 列表：
+        {"type": image/video/file, "data": {...}}
+        """
+        segments = []
+        try:
+            components = event.get_messages() or []
+        except Exception:
+            components = []
+        for comp in components:
+            try:
+                comp_type = getattr(comp, "type", None)
+                type_name = str(getattr(comp_type, "value", comp_type) or comp.__class__.__name__)
+                segment_type = self.COMPONENT_TYPE_TO_SEGMENT.get(type_name)
+                if not segment_type:
+                    continue
+                data = {}
+                url = str(getattr(comp, "url", "") or "")
+                if segment_type == "file":
+                    # File 组件的 .file 是可能触发同步下载的属性，只读 file_
+                    file_value = str(getattr(comp, "file_", "") or "")
+                else:
+                    file_value = str(getattr(comp, "file", "") or "")
+                if url and self._is_http_url(url):
+                    data["url"] = url
+                if file_value and self._is_http_url(file_value):
+                    data.setdefault("url", file_value)
+                if file_value and not self._is_http_url(file_value):
+                    data["file"] = file_value
+                if segment_type == "file":
+                    data["name"] = str(getattr(comp, "name", "") or "")
+                if segment_type == "image" and not data.get("url"):
+                    data["file"] = data.get("file") or url or file_value
+                if segment_type == "video" and not (data.get("url") or data.get("file")):
+                    data["file"] = file_value or url
+                if data.get("url") or data.get("file"):
+                    segments.append({"type": segment_type, "data": data})
+            except Exception as e:
+                logger.debug(f"解析消息组件失败，已跳过: {e}")
+        return segments
+
     def _prune_recent_upload_messages(self):
         now = time.time()
         expired_keys = [
@@ -153,30 +201,86 @@ class UploadService(PluginService):
         user_id = self._read_value(raw_message, "user_id")
         return self_id not in (None, "") and str(self_id) == str(user_id)
 
-    async def remember_uploadable_message(self, event: AstrMessageEvent):
-        """记录同会话最近的附件消息，供 素材 上传 使用。"""
-        self._prune_recent_upload_messages()
+    def _is_group_file_upload_notice(self, event: AstrMessageEvent) -> bool:
+        """判断是否为 OneBot 群文件上传通知（group_upload）。
+
+        QQ 群「群文件」上传时，OneBot 会发 post_type=notice / notice_type=group_upload
+        的通知事件，事件不带普通消息段，需要单独识别并转成附件段。
+        """
         raw_message = getattr(getattr(event, "message_obj", None), "raw_message", None)
         if not isinstance(raw_message, dict):
-            return
-        if self._is_self_message(raw_message):
+            return False
+        if raw_message.get("post_type") != "notice":
+            return False
+        if raw_message.get("notice_type") not in ("group_upload", "offline_file"):
+            return False
+        return isinstance(raw_message.get("file"), dict)
+
+    def _segments_from_group_upload_notice(self, event: AstrMessageEvent) -> List[Dict]:
+        """把 OneBot group_upload 通知转成可上传的 file 段。"""
+        raw_message = getattr(event.message_obj, "raw_message", None)
+        file_info = raw_message.get("file") if isinstance(raw_message, dict) else None
+        if not isinstance(file_info, dict):
+            return []
+        data: Dict = {
+            "file": str(file_info.get("name") or file_info.get("file") or ""),
+            "name": str(file_info.get("name") or ""),
+            "file_id": str(file_info.get("id") or file_info.get("file_id") or ""),
+        }
+        file_size = self._as_int(file_info.get("size"))
+        if file_size is not None:
+            data["file_size"] = file_size
+        busid = self._as_int(file_info.get("busid"))
+        if busid is not None:
+            data["busid"] = busid
+        url = str(file_info.get("url") or "")
+        if self._is_http_url(url):
+            data["url"] = url
+        if not data["file"] and not data["file_id"]:
+            return []
+        return [{"type": "file", "data": data}]
+
+    async def remember_uploadable_message(self, event: AstrMessageEvent):
+        """记录同会话最近的附件消息，供 素材 上传 使用。
+
+        兼容两类平台：
+        - OneBot（aiocqhttp）：raw_message 是 dict，附件在 message 段的 file/image/video；
+          群文件上传走 group_upload 通知，单独解析。
+        - QQ 官方机器人（qq_official）：raw_message 是 botpy 消息对象，附件由适配器
+          转成 AstrBot 的 Image/Video/File 组件，从消息组件提取。
+        """
+        self._prune_recent_upload_messages()
+        self._prune_group_auto_upload_seen()
+        raw_message = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if isinstance(raw_message, dict) and self._is_self_message(raw_message):
             return
 
-        segments = self._normalize_message_segments(raw_message.get("message"))
-        upload_segments = [segment for segment in segments if segment.get("type") in self.UPLOAD_SEGMENT_TYPES]
+        group_upload_notice = self._is_group_file_upload_notice(event)
+        if group_upload_notice:
+            upload_segments = self._segments_from_group_upload_notice(event)
+        elif isinstance(raw_message, dict):
+            segments = self._normalize_message_segments(raw_message.get("message"))
+            upload_segments = [
+                segment for segment in segments if segment.get("type") in self.UPLOAD_SEGMENT_TYPES
+            ]
+            if not upload_segments:
+                # 附件可能以 AstrBot 组件形式存在（部分适配器把消息段转成组件后不回填 dict）
+                upload_segments = self._extract_upload_components(event)
+        else:
+            upload_segments = self._extract_upload_components(event)
+
         if not upload_segments:
             return
 
         nav_key = self._get_navigation_state_key(event)
         cached_message = {
-            "group_id": raw_message.get("group_id"),
-            "message_id": raw_message.get("message_id"),
+            "group_id": self._get_event_group_id(event),
+            "message_id": (
+                raw_message.get("message_id") if isinstance(raw_message, dict) else None
+            ),
             "message": upload_segments,
+            "is_group_upload_notice": group_upload_notice,
         }
-        if cached_message.get("group_id") in (None, ""):
-            group_id = self._get_event_group_id(event)
-            if group_id not in (None, ""):
-                cached_message["group_id"] = group_id
 
         self.recent_upload_messages[nav_key] = {
             "timestamp": time.time(),
@@ -185,16 +289,229 @@ class UploadService(PluginService):
         self._prune_recent_upload_messages()
         logger.debug(
             f"已记录最近可上传附件消息: session={nav_key}, "
-            f"segments={len(upload_segments)}, message_id={cached_message.get('message_id')}"
+            f"segments={len(upload_segments)}, message_id={cached_message.get('message_id')}, "
+            f"group_upload={group_upload_notice}"
         )
 
-        # 私聊：收到素材附件即直接自动上传（无确认、无超时，应用后缀名过滤）
+        # 自动上传：私聊始终自动上传；群文件可按开关自动转存
         try:
             group_id = self._get_event_group_id(event)
             if group_id in (None, ""):
                 self._schedule_private_auto_upload(event, cached_message)
+            elif self._is_group_file_candidate(event, upload_segments, group_upload_notice):
+                if self._auto_upload_group_file_enabled():
+                    self._schedule_group_file_auto_upload(event, cached_message)
         except Exception as e:
-            logger.warning(f"私聊自动上传调度失败: {e}")
+            logger.warning(f"自动上传调度失败: {e}")
+
+    def _is_group_file_candidate(
+        self,
+        event: AstrMessageEvent,
+        segments: List[Dict],
+        group_upload_notice: bool,
+    ) -> bool:
+        """判断群消息是否属于「群文件」，值得按开关自动转存。
+
+        - OneBot：群文件区上传会发 group_upload 通知，属群文件。
+        - QQ 官方机器人：没有群文件区通知，群聊里的 File 类型附件即群文件
+          （图片/视频不算，避免把群聊图片全部自动转存）。
+        """
+        if group_upload_notice:
+            return True
+        if self._get_onebot_api(event) is not None:
+            # OneBot 群聊里的普通附件交给 素材 上传 手动处理，避免刷屏
+            return False
+        return any((segment.get("type") == "file") for segment in segments)
+
+    def _auto_upload_group_file_enabled(self) -> bool:
+        """群文件自动转存开关：默认关闭，WebUI 开启后群文件上传自动进 OpenList。"""
+        try:
+            return self._get_bool_config(self.get_global_config(), "group_file_auto_upload", False)
+        except Exception as e:
+            logger.debug(f"读取群文件自动转存开关失败，按关闭处理: {e}")
+            return False
+
+    def _prune_group_auto_upload_seen(self):
+        now = time.time()
+        expired = [
+            key
+            for key, ts in self._group_auto_upload_seen.items()
+            if now - ts > self.GROUP_AUTO_UPLOAD_DEDUPE_TTL_SECONDS
+        ]
+        for key in expired:
+            self._group_auto_upload_seen.pop(key, None)
+
+    def _group_upload_dedupe_key(self, event: AstrMessageEvent, cached_message: Dict) -> str:
+        """群文件去重键：同一群同一 file_id 只自动转存一次。"""
+        group_id = cached_message.get("group_id") or self._get_event_group_id(event) or ""
+        file_ids = []
+        for segment in self._extract_upload_segments(cached_message):
+            file_id = str((segment.get("data") or {}).get("file_id") or "")
+            if file_id:
+                file_ids.append(file_id)
+        if not file_ids:
+            names = [
+                str((segment.get("data") or {}).get("name") or (segment.get("data") or {}).get("file") or "")
+                for segment in self._extract_upload_segments(cached_message)
+            ]
+            file_ids = [name for name in names if name]
+        file_ids.sort()
+        return f"{group_id}:{'|'.join(file_ids)}"
+
+    def _schedule_group_file_auto_upload(self, event: AstrMessageEvent, cached_message: Dict):
+        """群文件上传通知到达后，在后台把文件转存到 OpenList。"""
+        dedupe_key = self._group_upload_dedupe_key(event, cached_message)
+        if not dedupe_key or dedupe_key.endswith(":"):
+            return
+        if self._group_auto_upload_seen.get(dedupe_key):
+            logger.debug(f"[群文件自动转存] 已处理过，跳过: {dedupe_key}")
+            return
+        self._group_auto_upload_seen[dedupe_key] = time.time()
+
+        user_id = event.get_sender_id()
+        try:
+            user_config = self.get_user_config(user_id)
+        except Exception:
+            global_cfg = None
+            try:
+                global_cfg = self.get_global_config()
+            except Exception:
+                pass
+            user_config = global_cfg or {}
+        if not self._validate_config(user_config):
+            logger.warning("[群文件自动转存] 未配置 OpenList 连接信息，跳过。")
+            return
+        group_id = self._get_event_group_id(event)
+        target_path = self._group_file_target_path(user_config, group_id)
+        logger.info(
+            f"[群文件自动转存] 群 {group_id} 新群文件，目标目录 {target_path}，"
+            f"上传者 {user_id}"
+        )
+        task = asyncio.create_task(
+            self._auto_upload_group_file(event, cached_message, target_path, str(user_id))
+        )
+        self._auto_upload_tasks.add(task)
+        task.add_done_callback(self._auto_upload_tasks.discard)
+
+    def _group_file_target_path(self, user_config: Dict, group_id) -> str:
+        """群文件自动转存的目标目录：优先用户/全局设置里的目标目录，最后根目录。"""
+        value = user_config.get("group_file_upload_path")
+        if isinstance(value, str) and value.strip():
+            return self._normalize_openlist_path(value.strip())
+        try:
+            raw = self.get_global_config().get("group_file_upload_path")
+        except Exception:
+            raw = None
+        if isinstance(raw, str) and raw.strip():
+            return self._normalize_openlist_path(raw.strip())
+        return "/"
+
+    async def _auto_upload_group_file(
+        self,
+        event: AstrMessageEvent,
+        cached_message: Dict,
+        target_path: str,
+        user_id: str,
+    ):
+        """把群文件上传的附件转存到 OpenList（同一群文件的重复通知已去重）。"""
+        user_config = self.get_user_config(user_id)
+        upload_segments = self._extract_upload_segments(cached_message)
+        if not upload_segments:
+            return
+
+        origin = getattr(event, "unified_msg_origin", None) or ""
+        group_id = cached_message.get("group_id") or self._get_event_group_id(event)
+
+        async def notify(text: str):
+            if origin:
+                try:
+                    chain = MessageChain().message(text)
+                    await self.plugin.context.send_message(origin, chain)
+                    return
+                except Exception as e:
+                    logger.warning(f"[群文件自动转存] 回执发送失败: {e}")
+            logger.info(f"[群文件自动转存] {text}")
+
+        max_upload_size_mb = self._get_size_limit_mb(user_config, "max_upload_size", 100)
+        max_upload_size = max_upload_size_mb * 1024 * 1024 if max_upload_size_mb > 0 else 0
+        success_count = 0
+        fail_count = 0
+
+        try:
+            async with self._create_openlist_client(user_config) as client:
+                if target_path not in ("", "/"):
+                    await client.ensure_dir(target_path)
+                for index, segment in enumerate(upload_segments, start=1):
+                    # 群文件段通常没有直链，需通过 get_group_file_url + file_id 解析
+                    seg_data = segment.get("data") or {}
+                    if not seg_data.get("url") and seg_data.get("file_id"):
+                        resolved_url = await self._get_group_file_url(
+                            event,
+                            group_id,
+                            str(seg_data.get("file_id")),
+                            self._as_int(seg_data.get("busid")) or 0,
+                        )
+                        if resolved_url:
+                            seg_data["url"] = resolved_url
+                            segment["data"] = seg_data
+
+                    item = await self._build_upload_item(event, cached_message, segment)
+                    file_name = item["name"]
+                    file_size = item["size"]
+                    source_url = item["url"]
+
+                    if not source_url:
+                        fail_count += 1
+                        logger.error(f"[群文件自动转存] 无法获取群文件下载地址: {file_name}")
+                        continue
+
+                    if not self._is_extension_allowed(file_name, user_config):
+                        fail_count += 1
+                        logger.info(f"[群文件自动转存] 已按设置过滤（后缀名不允许）: {file_name}")
+                        continue
+
+                    if file_size is None and max_upload_size_mb > 0:
+                        file_size = await self._probe_url_size(source_url, user_config)
+
+                    if max_upload_size_mb > 0:
+                        if file_size is None:
+                            fail_count += 1
+                            logger.warning(f"[群文件自动转存] 无法确认文件大小，跳过: {file_name}")
+                            continue
+                        if file_size > max_upload_size:
+                            fail_count += 1
+                            logger.info(
+                                f"[群文件自动转存] 文件过大跳过: {file_name} "
+                                f"{file_size / (1024 * 1024):.1f}MB > {max_upload_size_mb}MB"
+                            )
+                            continue
+
+                    logger.info(f"[群文件自动转存] 开始上传 ({index}/{len(upload_segments)}): {file_name}")
+                    success = await self._upload_url_stream_with_retry(
+                        client,
+                        source_url,
+                        target_path,
+                        file_name,
+                        file_size,
+                        user_config,
+                        refresh_url=item.get("refresh_url"),
+                    )
+                    if success:
+                        success_count += 1
+                    else:
+                        fail_count += 1
+                        logger.error(f"[群文件自动转存] 上传失败: {file_name}")
+
+                self.cache_manager.clear_cache()
+                if success_count:
+                    await notify(
+                        f"📁 群文件已转存到 {target_path}\n"
+                        f"📊 成功 {success_count}，失败 {fail_count}"
+                    )
+                elif fail_count:
+                    logger.error(f"[群文件自动转存] 全部失败: 总计 {len(upload_segments)}")
+        except Exception as e:
+            logger.error(f"[群文件自动转存] 自动上传失败: {e}", exc_info=True)
 
     def _auto_upload_enabled(self, user_config: Dict) -> bool:
         """私聊自动上传开关：默认开启，配置 private_auto_upload 为 False 时关闭。"""
@@ -211,16 +528,20 @@ class UploadService(PluginService):
             return
         if not self._auto_upload_enabled(user_config):
             return
-        import asyncio
         origin = getattr(event, "unified_msg_origin", None) or ""
         task = asyncio.create_task(
             self._auto_upload_private(event, user_id, cached_message, origin)
         )
         # 保存引用防止被 GC；完成时清理
-        if not hasattr(self, "_auto_upload_tasks"):
-            self._auto_upload_tasks = set()
         self._auto_upload_tasks.add(task)
         task.add_done_callback(self._auto_upload_tasks.discard)
+
+    def _get_onebot_api(self, event: AstrMessageEvent):
+        """获取 OneBot 风格的 bot API；QQ 官方机器人等平台没有 call_action，返回 None。"""
+        api = getattr(getattr(event, "bot", None), "api", None)
+        if api is None or not callable(getattr(api, "call_action", None)):
+            return None
+        return api
 
     async def _resolve_private_file_url(self, event: AstrMessageEvent, segment: Dict, user_id: str) -> Optional[str]:
         """解析私聊文件下载 URL（OneBot get_private_file_url）。"""
@@ -228,8 +549,7 @@ class UploadService(PluginService):
         file_id = data.get("file_id")
         if not file_id:
             return None
-        bot = getattr(event, "bot", None)
-        api = getattr(bot, "api", None)
+        api = self._get_onebot_api(event)
         if api is None:
             return None
         try:
@@ -437,8 +757,12 @@ class UploadService(PluginService):
     async def _get_group_file_url(self, event: AstrMessageEvent, group_id, file_id: str, busid: int = 0) -> Optional[str]:
         if not group_id or not file_id:
             return None
+        api = self._get_onebot_api(event)
+        if api is None:
+            # QQ 官方机器人没有 get_group_file_url，附件直链已在消息组件里
+            return None
         try:
-            url_res = await event.bot.api.call_action(
+            url_res = await api.call_action(
                 "get_group_file_url",
                 group_id=int(group_id),
                 file_id=file_id,

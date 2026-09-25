@@ -160,6 +160,18 @@
                 "default": true,
                 "hint": "开启后，当新用户添加机器人为好友(friend_add 通知)时，自动向该用户发送一份 素材 帮助。关闭则不发送。"
             },
+            "group_file_auto_upload": {
+                "description": "群文件上传自动转存",
+                "type": "bool",
+                "default": false,
+                "hint": "开启后，群文件会自动转存到 OpenList（同一文件只转存一次）。OneBot 下指 QQ「群文件」上传；QQ 官方机器人下指群聊中发送的文件类型附件。关闭时仍可用 素材 上传 手动转存。"
+            },
+            "group_file_upload_path": {
+                "description": "群文件自动转存目录",
+                "type": "string",
+                "default": "",
+                "hint": "群文件自动转存到 OpenList 的目标目录，如 /群文件。留空表示转存到根目录 /。仅在开启「群文件上传自动转存」时生效。"
+            },
             "require_user_auth": {
                 "description": "要求用户认证",
                 "type": "bool",
