@@ -3,11 +3,14 @@
 运行：/tmp/olvenv/bin/python tests/test_platform_adaptation.py
 """
 import asyncio
+import html as html_lib
 import importlib
 import os
+import re
 import sys
 import tempfile
 import types
+from urllib.parse import urlparse
 from enum import Enum
 
 # ---------------------------------------------------------------- astrbot stubs
@@ -424,6 +427,73 @@ PASS, FAIL = [], []
 def check(name, cond, detail=""):
     (PASS if cond else FAIL).append(name)
     print(f"{'✅' if cond else '❌'} {name}" + (f" — {detail}" if detail and not cond else ""))
+
+
+def t_flash_share_link_extraction():
+    plugin = FakePlugin()
+    svc = plugin.upload_service
+    event = FakeEvent(message_str="这个文件 https://qfile.qq.com/q/WnNh012Agi 请收下")
+    links = svc._extract_flash_share_links(event)
+    check("闪传消息提取标准分享链接", links == ["https://qfile.qq.com/q/WnNh012Agi"], f"{links}")
+
+
+def t_flash_share_link_rejects_untrusted_hosts():
+    plugin = FakePlugin()
+    svc = plugin.upload_service
+    event = FakeEvent(message_str="https://evil.example/q/WnNh012Agi https://qfile.qq.com.evil.test/q/abc")
+    check("闪传链接提取仅接受官方 qfile host", svc._extract_flash_share_links(event) == [])
+
+
+
+def _build_flash_nuxt_fixture(file_entries):
+    payload = [None] * 10
+    payload[0] = ["ShallowReactive", 1]
+    payload[1] = {"data": 2, "state": 3, "pinia": 4}
+    payload[2] = {}
+    payload[3] = {}
+    payload[4] = {"meta": 5}
+    payload[5] = {"fileSetInfo": 6}
+    payload[6] = {"filesetId": 7}
+    payload[7] = "multi-file-id-12345678"
+    payload[8] = None
+    payload[9] = None
+    records=[]; id_indices={}
+    for item in file_entries:
+        idx=len(payload);id_indices[item["id"]]=idx+2
+        payload.extend([item["name"],str(item.get("size",1000)),item["id"],item.get("parent_id", ""),bool(item.get("is_dir",False))])
+        payload.append({"name":idx,"file_size":idx+1,"srv_fileid":idx+2,"parent_id":idx+3,"is_dir":idx+4})
+        records.append(len(payload)-1)
+    for item,idx in zip(file_entries,records):
+        if item.get("parent_id"): payload[idx]["parent_id"]=id_indices[item["parent_id"]]
+    row_idx=len(payload);end_idx=row_idx+1;files_idx=row_idx+2;rows_idx=row_idx+3;data_idx=rows_idx+1;resp_idx=data_idx+1
+    payload.extend([{"is_end":end_idx,"file_list":files_idx},True,records,[row_idx],{"file_lists":rows_idx},{"data":data_idx,"message":9,"retcode":9,"error":9}])
+    key=f'trpc.file.FileFlashTrans/GetFileList_{{"fileset_id":"multi-file-id-12345678"}}'
+    payload[2]={key:resp_idx}
+    for i, item in enumerate(file_entries):
+        url_idx=len(payload)+1
+        payload.extend([{"url":url_idx},f"https://multimedia.qfile.qq.com/download?appid=14903&fileid=download-token-{i}&rkey=sig"])
+    return f'<title>Share｜QQ闪传</title><script id="__NUXT_DATA__">{__import__("json").dumps(payload)}</script>'
+
+
+def t_flash_html_parser_single_file_and_rejects_thumbnail_lists():
+    plugin = FakePlugin()
+    svc = plugin.upload_service
+    html = '<title>IMG_0021.JPG｜QQ闪传</title><meta property="og:image" content="https://multimedia.qfile.qq.com/download?appid=14903&amp;fileid=abc&amp;rkey=xyz">'
+    check("未含结构化文件项的页面不被猜测解析", svc._parse_flash_share_html(html) is None)
+    check("文件名路径清理", svc._safe_flash_filename("../资料/报告.pdf") == "报告.pdf")
+    check("空白非法文件名有安全回退", svc._safe_flash_filename("../") == "qq_flash_file")
+    parsed_multi = svc._parse_flash_share_html(_build_flash_nuxt_fixture([
+        {"name": "a.txt", "id": "service-a", "size": 1000},
+        {"name": "b.pdf", "id": "service-b", "size": 1001},
+        {"name": "c.zip", "id": "service-c", "size": 1002},
+    ]))
+    check("多文件 SSR 文件列表解析数量", parsed_multi is not None and len(parsed_multi) == 3, str(parsed_multi))
+    check("多文件名称/大小/下载地址分别解析", parsed_multi is not None and [(x["name"], x["size"], x["url"].split("fileid=")[1].split("&")[0]) for x in parsed_multi] == [("a.txt", 1000, "download-token-0"), ("b.pdf", 1001, "download-token-1"), ("c.zip", 1002, "download-token-2")])
+    tree = svc._parse_flash_share_html(_build_flash_nuxt_fixture([
+        {"name": "docs", "id": "dir-docs", "is_dir": True},
+        {"name": "report.pdf", "id": "file-report", "parent_id": "dir-docs", "size": 1234},
+    ]))
+    check("目录项及子文件路径一起解析", tree is not None and len(tree) == 2 and tree[0]["is_dir"] and tree[1]["relative_path"] == "docs/report.pdf", str(tree))
 
 
 def t1_group_upload_notice():
@@ -973,6 +1043,9 @@ def t11_webui_toggle_reaches_runtime():
 
 
 if __name__ == "__main__":
+    t_flash_share_link_extraction()
+    t_flash_share_link_rejects_untrusted_hosts()
+    t_flash_html_parser_single_file_and_rejects_thumbnail_lists()
     t1_group_upload_notice()
     t2_botpy_object_components()
     t3_qq_official_private()

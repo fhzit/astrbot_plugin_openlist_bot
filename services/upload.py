@@ -1,9 +1,11 @@
 import asyncio
+import html as html_lib
+import json
 import os
 import posixpath
 import re
 import time
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import unquote, urlparse
 
 import aiohttp
@@ -19,6 +21,7 @@ from .base import PluginService
 class UploadService(PluginService):
     """Upload service."""
 
+    FLASH_SHARE_LINK_RE = re.compile(r"https?://qfile\.qq\.com/q/[A-Za-z0-9]+", re.IGNORECASE)
     CQ_SEGMENT_RE = re.compile(r"\[CQ:([a-zA-Z0-9_]+)(?:,([^\]]*))?\]")
     UPLOAD_SEGMENT_TYPES = {"file", "image", "video"}
     RECENT_UPLOAD_TTL_SECONDS = 300
@@ -32,6 +35,295 @@ class UploadService(PluginService):
         self._submit_name_cursor = {}
         self._auto_upload_tasks = set()
         self._group_auto_upload_seen = {}
+        self._flash_share_seen = {}
+
+    def _extract_flash_share_links(self, event: AstrMessageEvent) -> List[str]:
+        """提取消息中的 qfile.qq.com 闪传分享链接（忽略其他主机）。"""
+        message = str(getattr(event, "message_str", "") or "")
+        links = []
+        for match in self.FLASH_SHARE_LINK_RE.finditer(message):
+            link = match.group(0).rstrip(".,;!?，。；！？)]}>")
+            if link not in links:
+                links.append(link)
+        return links
+
+    @staticmethod
+    def _safe_flash_filename(name: str) -> str:
+        """保留分享文件名但剥离目录/控制字符，避免 OpenList 路径穿越。"""
+        name = str(name or "").replace("\\", "/").split("/")[-1]
+        name = "".join(ch for ch in name if ch >= " " and ch not in "<>:\"|?*").strip(" .")
+        return name or "qq_flash_file"
+
+    def _schedule_flash_share_upload(self, event: AstrMessageEvent):
+        """在后台处理聊天消息中的 QQ 闪传分享链接。"""
+        links = self._extract_flash_share_links(event)
+        if not links:
+            return
+        now = time.time()
+        self._flash_share_seen = {key: ts for key, ts in self._flash_share_seen.items() if now - ts < 1800}
+        user_id = str(event.get_sender_id())
+        for link in links:
+            key = f"{user_id}:{link}"
+            if key in self._flash_share_seen:
+                continue
+            self._flash_share_seen[key] = now
+            task = asyncio.create_task(self._auto_upload_flash_share(event, user_id, link))
+            self._auto_upload_tasks.add(task)
+            task.add_done_callback(self._auto_upload_tasks.discard)
+
+    @staticmethod
+    def _parse_flash_share_html(html: str):
+        """解析 QQ 闪传 SSR 数据并映射签名原文件 URL；返回每项 name/url/size。"""
+        title_match = re.search(r"<title>\s*(.*?)\s*(?:｜|\|)\s*QQ闪传\s*</title>", html, re.I | re.S)
+        share_title = html_lib.unescape(re.sub(r"<[^>]+>", "", title_match.group(1))).strip() if title_match else ""
+        data_match = re.search(r'<script[^>]+id=["\']__NUXT_DATA__["\'][^>]*>(.*?)</script>', html, re.I | re.S)
+        if not data_match:
+            return None
+        try:
+            payload = json.loads(data_match.group(1))
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, list):
+            return None
+
+        def ref(value: Any) -> Any:
+            seen = set()
+            while True:
+                if isinstance(value, int) and not isinstance(value, bool):
+                    if value < 0 or value >= len(payload) or value in seen:
+                        return None
+                    seen.add(value)
+                    value = payload[value]
+                    continue
+                if isinstance(value, list) and len(value) == 2 and value[0] in ("ShallowReactive", "Reactive", "Ref", "Computed"):
+                    value = value[1]
+                    continue
+                return value
+        try:
+            root = ref(1)
+            pinia = ref(root["pinia"])
+            meta = ref(pinia["meta"])
+            file_set_id = ref(ref(meta["fileSetInfo"]).get("filesetId"))
+            data_map = ref(root["data"])
+            list_key = next(k for k in data_map if isinstance(k, str) and "GetFileList_" in k)
+            response = ref(data_map[list_key])
+            result_data = ref(response["data"])
+            file_lists = ref(result_data["file_lists"])
+        except (KeyError, TypeError, StopIteration):
+            return None
+        if not file_set_id or not isinstance(file_lists, list):
+            return None
+        files = []
+        seen_files = set()
+        pending_dirs = {}
+        for row_ref in file_lists:
+            row = ref(row_ref)
+            if not isinstance(row, dict):
+                continue
+            parent_id = ref(row.get("parent_id")) or ""
+            row_files = ref(row.get("file_list"))
+            if not isinstance(row_files, list):
+                continue
+            parent_id = str(parent_id)
+            if parent_id and parent_id not in pending_dirs:
+                path_parts = []
+                ancestor_id = parent_id
+                ancestor_seen = set()
+                while ancestor_id and ancestor_id not in ancestor_seen:
+                    ancestor_seen.add(ancestor_id)
+                    ancestor = pending_dirs.get(ancestor_id)
+                    if not ancestor:
+                        path_parts = []
+                        break
+                    path_parts.append(ancestor["name"])
+                    ancestor_id = ancestor["parent_id"]
+                if path_parts:
+                    pending_dirs[parent_id] = {"name": "/".join(reversed(path_parts)), "parent_id": ""}
+            for file_ref in row_files:
+                item = ref(file_ref)
+                if not isinstance(item, dict):
+                    continue
+                name = ref(item.get("name"))
+                file_id = ref(item.get("srv_fileid")) or ref(item.get("cli_fileid"))
+                size_raw = ref(item.get("file_size"))
+                is_dir = ref(item.get("is_dir"))
+                if not name or not file_id or file_id in seen_files:
+                    continue
+                seen_files.add(file_id)
+                name = html_lib.unescape(str(name))
+                item_parent_id = str(ref(item.get("parent_id")) or parent_id)
+                if is_dir is True:
+                    pending_dirs[str(file_id)] = {"name": name, "parent_id": item_parent_id}
+                    files.append({"name": name, "relative_path": name, "file_id": str(file_id), "size": 0, "is_dir": True})
+                    continue
+                path_prefix = pending_dirs.get(item_parent_id, {}).get("name", "")
+                relative_path = f"{path_prefix}/{name}" if path_prefix else name
+                try:
+                    size = int(size_raw)
+                except (TypeError, ValueError):
+                    size = None
+                files.append({"name": html_lib.unescape(str(name)), "relative_path": relative_path, "file_id": str(file_id), "size": size, "is_dir": False})
+        if not files:
+            meta_match = re.search(r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)', html, re.I)
+            if not share_title or not meta_match:
+                return None
+            download_url = html_lib.unescape(meta_match.group(1))
+            parsed = urlparse(download_url)
+            if parsed.scheme != "https" or parsed.hostname != "multimedia.qfile.qq.com" or not parsed.path.startswith("/download"):
+                return None
+            if re.search(r'class="file-item(?:\s|\")', html):
+                return None
+            return [{"name": share_title, "url": download_url, "size": None}]
+
+        fileset_match = re.search(r'"fileset_id"\s*:\s*"([a-zA-Z0-9-]{8,})"', list_key)
+        if not fileset_match or fileset_match.group(1) != str(file_set_id):
+            return None
+        downloads = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            item = ref(item)
+            if not isinstance(item, dict):
+                continue
+            raw_url = ref(item.get("url"))
+            if not isinstance(raw_url, str):
+                continue
+            parsed = urlparse(raw_url)
+            if parsed.scheme != "https" or parsed.hostname != "multimedia.qfile.qq.com" or parsed.path != "/download":
+                continue
+            params = dict(part.split("=", 1) for part in parsed.query.split("&") if "=" in part)
+            if params.get("appid") == "14903" and params.get("fileid"):
+                downloads.append((params["fileid"], raw_url))
+        unique_downloads = {}
+        for file_id, url in downloads:
+            unique_downloads.setdefault(file_id, url)
+        downloads = list(unique_downloads.items())
+        url_by_id = {file_id: url for file_id, url in downloads}
+        unmatched = [item for item in files if not item.get("is_dir") and item["file_id"] not in url_by_id]
+        eligible = [item for item in files if not item.get("is_dir")]
+        if unmatched and len(downloads) == len(eligible):
+            # SSR listing IDs may differ from transfer tokens; verified one-to-one ordering is used.
+            url_by_id.update({item["file_id"]: url for item, (_, url) in zip(eligible, downloads)})
+        for item in files:
+            item["url"] = url_by_id.get(item["file_id"])
+        files = [item for item in files if item["url"]]
+        return files or None
+
+    async def _auto_upload_flash_share(self, event: AstrMessageEvent, user_id: str, share_url: str):
+        """从 QQ 分享页提取官方下载地址并通过 OpenList URL 转存。"""
+        origin = getattr(event, "unified_msg_origin", None) or ""
+
+        async def notify(text: str):
+            if origin:
+                try:
+                    await self.plugin.context.send_message(origin, MessageChain().message(text))
+                    return
+                except Exception as exc:
+                    logger.warning(f"闪传上传回执发送失败: {exc}")
+            logger.info(f"[QQ闪传自动上传] {text}")
+
+        try:
+            user_config = self.get_user_config(user_id)
+            if not self._validate_config(user_config):
+                await notify("❌ QQ闪传未上传：OpenList 尚未配置。")
+                return
+            if self._get_event_group_id(event) in (None, "") and not self._auto_upload_enabled(user_config):
+                return
+
+            timeout = aiohttp.ClientTimeout(total=45, sock_connect=15, sock_read=30)
+            headers = {"User-Agent": "Mozilla/5.0 (compatible; AstrBotOpenList/1.0)"}
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get(share_url, allow_redirects=False) as response:
+                    if response.status not in (301, 302, 303, 307, 308):
+                        if response.status != 200:
+                            await notify(f"❌ QQ闪传解析失败：分享页返回 HTTP {response.status}。")
+                            return
+                        final_url = response.url
+                    else:
+                        location = response.headers.get("Location", "")
+                        final_url = response.url.join(__import__("yarl").URL(location)) if location else None
+                    if not final_url or urlparse(str(final_url)).hostname not in ("qfile.qq.com", "www.qfile.qq.com"):
+                        await notify("❌ 闪传分享链接跳转到非官方主机，已停止处理。")
+                        return
+                    if response.status == 200:
+                        html = await response.text(errors="replace")
+                    else:
+                        async with session.get(final_url, allow_redirects=False) as page:
+                            if page.status != 200 or urlparse(str(page.url)).hostname not in ("qfile.qq.com", "www.qfile.qq.com"):
+                                await notify(f"❌ QQ闪传解析失败：分享页返回 HTTP {page.status}。")
+                                return
+                            html = await page.text(errors="replace")
+
+            parsed_share = self._parse_flash_share_html(html)
+            if not parsed_share:
+                await notify("❌ 闪传分享页无法安全解析，或没有可用的原文件下载地址。")
+                return
+            if any("url" not in item for item in parsed_share):
+                await notify("❌ 闪传分享包含尚未支持解析的文件，未执行部分转存。")
+                return
+
+            target_path = "/"
+            try:
+                if self.is_submit_mode(user_config):
+                    target_path = self.get_user_submit_dir(self.get_submit_root(user_config), user_id)
+            except Exception:
+                pass
+            if self._get_event_group_id(event) is None:
+                import datetime
+                target_path = self._normalize_openlist_path(f"{target_path.rstrip('/')}/{datetime.datetime.now().strftime('%Y_%m_%d')}")
+            max_mb = self._get_size_limit_mb(user_config, "max_upload_size", 100)
+            total_count = sum(1 for entry in parsed_share if not entry.get("is_dir"))
+            success_count = 0
+            fail_count = 0
+            skipped_count = 0
+            async with self._create_openlist_client(user_config) as client:
+                if target_path not in ("", "/"):
+                    await client.ensure_dir(target_path)
+                for index, item in enumerate(parsed_share, start=1):
+                    relative_path = item.get("relative_path") or item["name"]
+                    relative_parts = [part for part in relative_path.replace("\\", "/").split("/") if part not in ("", ".", "..")]
+                    if not relative_parts:
+                        continue
+                    safe_relative_path = "/".join(self._safe_flash_filename(part) for part in relative_parts)
+                    parent_parts = safe_relative_path.split("/")[:-1]
+                    file_target_path = target_path
+                    if parent_parts:
+                        file_target_path = self._normalize_openlist_path(posixpath.join(target_path, *parent_parts))
+                    if item.get("is_dir"):
+                        await client.ensure_dir(self._normalize_openlist_path(posixpath.join(target_path, safe_relative_path)))
+                        continue
+                    name = self._safe_flash_filename(item["name"])
+                    download_url = item["url"]
+                    if parent_parts:
+                        await client.ensure_dir(file_target_path)
+                    size = item.get("size")
+                    if not self._is_extension_allowed(name, user_config):
+                        skipped_count += 1
+                        logger.info(f"[QQ闪传自动上传] 后缀不允许，跳过: {name}")
+                        continue
+                    if size is None:
+                        size = await self._probe_url_size(download_url, user_config)
+                    if max_mb > 0 and (size is None or size > max_mb * 1024 * 1024):
+                        skipped_count += 1
+                        logger.warning(f"[QQ闪传自动上传] 大小无法确认或超过限制，跳过: {name}")
+                        continue
+                    ok = await self._upload_url_stream_with_retry(
+                        client, download_url, file_target_path, safe_relative_path.split("/")[-1], size, user_config
+                    )
+                    if ok:
+                        success_count += 1
+                    else:
+                        fail_count += 1
+                        logger.error(f"[QQ闪传自动上传] 上传失败 ({index}/{total_count}): {name}")
+            if success_count:
+                self.cache_manager.clear_cache()
+            await notify(
+                f"📁 QQ闪传转存到 {target_path}\n"
+                f"📊 成功 {success_count}，失败 {fail_count}，跳过 {skipped_count}（共 {total_count} 个文件）"
+            )
+        except Exception as exc:
+            logger.error(f"[QQ闪传自动上传] 处理失败: {exc}", exc_info=True)
+            await notify("❌ QQ闪传解析或上传失败，请查看插件日志。")
 
     async def _upload_file_with_retry(
         self,
@@ -251,6 +543,10 @@ class UploadService(PluginService):
         """
         self._prune_recent_upload_messages()
         self._prune_group_auto_upload_seen()
+        try:
+            self._schedule_flash_share_upload(event)
+        except Exception as e:
+            logger.warning(f"[QQ闪传自动上传] 任务调度失败: {e}")
         raw_message = getattr(getattr(event, "message_obj", None), "raw_message", None)
         if isinstance(raw_message, dict) and self._is_self_message(raw_message):
             return
